@@ -1,18 +1,19 @@
 ---
 name: memory
-description: Write to the {{DB_NAME}} database - session notes, memories, user observations, session close, and Rule 11 back-pointers - through a bundled script instead of hand-written SQL. Use for EVERY write to memories / session_notes / user_observations / sessions, which per the global rules means: logging a decision, attempt, discovery, blocker or milestone as work happens; recording completed work, a preference, an architecture decision or a limitation; noting a passive observation about the user; closing a session; or attaching a transcript span to something you just promoted. Also runs as /memory. Do NOT hand-write INSERT INTO memories / session_notes / user_observations - the escaping is fragile, and every literal command mints a single-use permission rule. READS are not here: use /recall or the reference_queries.
+description: Write to the claude_memory database - session notes, memories, user observations, session close, and Rule 11 back-pointers - through a bundled script instead of hand-written SQL. Use for EVERY write to memories / session_notes / user_observations / sessions, which per the global rules means: logging a decision, attempt, discovery, blocker or milestone as work happens; recording completed work, a preference, an architecture decision or a limitation; noting a passive observation about the user; closing a session; or attaching a transcript span to something you just promoted. Also runs as /memory. Do NOT hand-write INSERT INTO memories / session_notes / user_observations - the escaping is fragile, and every literal command mints a single-use permission rule. READS are not here: use /recall or the reference_queries.
 argument-hint: [what you want to record]
 ---
 
-Every write to `{{DB_NAME}}` goes through the bundled script. Reads do not - `/recall` and the
-`reference_queries` table already cover those.
+Every write to `claude_memory` (SQLite, through memdb) goes through the bundled script. Reads do
+not - `/recall` and the `reference_queries` table already cover those.
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File "{{CLAUDE_HOME_WIN}}\skills\memory\scripts\mem.ps1" -Action note -SessionId <id> -Type decision -Title "..." -ContentFile <path>
 ```
 
-`-ExecutionPolicy Bypass` is required: LocalMachine policy is `Restricted`, so a script launched
-from a fresh shell is blocked without it. It is a per-process flag and changes no system setting.
+`-ExecutionPolicy Bypass` is required wherever the machine's policy is `Restricted` (the Windows
+default): a script launched from a fresh shell is blocked without it. It is a per-process flag and
+changes no system setting.
 
 ## Actions
 

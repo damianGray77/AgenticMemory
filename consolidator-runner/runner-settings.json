@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(\"{{MYSQL_EXE_POSIX}}\":*)",
+      "Bash(\"{{MEMDB_POSIX}}\":*)",
       "Bash(date:*)",
       "Read",
       "Edit(/{{CONSOLIDATOR_ROOT_POSIX}}/runs/**)"

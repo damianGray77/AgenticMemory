@@ -7,7 +7,7 @@ $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
 # One path in the three spellings the templates use:
 #   Win   C:\Users\me\.claude    (PowerShell, settings.json, CLAUDE.md prose)
-#   Fwd   C:/Users/me/.claude    (hook commands, mysql SOURCE)
+#   Fwd   C:/Users/me/.claude    (hook commands)
 #   Posix /c/Users/me/.claude    (Git Bash scripts)
 function Get-PathForms {
     param([Parameter(Mandatory = $true)] [string] $Path)
@@ -22,20 +22,18 @@ function Get-PathForms {
 # Token -> value, for every {{TOKEN}} the templates may contain.
 function Get-TokenMap {
     param(
-        [string] $UserName, [string] $DbName, [string] $MysqlUser, [string] $MysqlPassword,
-        [string] $MysqlExe, [string] $ClaudeHome, [string] $ConsolidatorRoot, [string] $ClaudeCli
+        [string] $UserName, [string] $ClaudeHome, [string] $DbPath,
+        [string] $ConsolidatorRoot, [string] $ClaudeCli
     )
-    $exe  = Get-PathForms $MysqlExe
     $home_ = Get-PathForms $ClaudeHome
-    $run  = Get-PathForms $ConsolidatorRoot
+    $memdb = Get-PathForms (Join-Path $ClaudeHome 'bin\memdb.exe')
+    $db    = Get-PathForms $DbPath
+    $run   = Get-PathForms $ConsolidatorRoot
     $map = [ordered]@{
         USER_NAME               = $UserName
-        DB_NAME                 = $DbName
-        MYSQL_USER              = $MysqlUser
-        MYSQL_PASSWORD          = $MysqlPassword
-        MYSQL_EXE_WIN           = $exe.Win
-        MYSQL_EXE_FWD           = $exe.Fwd
-        MYSQL_EXE_POSIX         = $exe.Posix
+        MEMDB_WIN               = $memdb.Win
+        MEMDB_POSIX             = $memdb.Posix
+        DB_PATH_WIN             = $db.Win
         CLAUDE_HOME_WIN         = $home_.Win
         CLAUDE_HOME_FWD         = $home_.Fwd
         CLAUDE_HOME_POSIX       = $home_.Posix
@@ -60,33 +58,27 @@ function Write-Utf8 {
     [System.IO.File]::WriteAllText($Path, $Text, $script:Utf8NoBom)
 }
 
-# Run mysql.exe and return its stdout decoded as UTF-8, exactly. Piping a native command's output
-# through PowerShell decodes it with the console code page instead, which mangles non-ASCII prose.
-# The password travels in MYSQL_PWD so it never appears on a command line.
-function Invoke-MysqlCapture {
+# Run memdb and return its stdout decoded as UTF-8, exactly. Piping a native command's output
+# through PowerShell decodes it with the console code page instead, which mangles non-ASCII text.
+function Invoke-MemdbCapture {
     param(
-        [Parameter(Mandatory = $true)] [string] $MysqlExe,
-        [Parameter(Mandatory = $true)] [string] $MysqlUser,
-        [Parameter(Mandatory = $true)] [string] $MysqlPassword,
-        [string] $Database,
-        [Parameter(Mandatory = $true)] [string] $Sql   # must not contain double quotes
+        [Parameter(Mandatory = $true)] [string] $Memdb,
+        [Parameter(Mandatory = $true)] [string[]] $Arguments
     )
-    if ($Sql.Contains('"')) { throw 'Invoke-MysqlCapture: the SQL must not contain double quotes.' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $MysqlExe
-    $dbArg = ''
-    if ($Database) { $dbArg = " $Database" }
-    $psi.Arguments = "-u $MysqlUser --default-character-set=utf8mb4 -N -r -B$dbArg -e `"$Sql`""
+    $psi.FileName = $Memdb
+    $psi.Arguments = ($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' } else { $_ }
+    }) -join ' '
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = $script:Utf8NoBom
     $psi.StandardErrorEncoding = $script:Utf8NoBom
-    $psi.EnvironmentVariables['MYSQL_PWD'] = $MysqlPassword
     $p = [System.Diagnostics.Process]::Start($psi)
     $out = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEndAsync()
     $p.WaitForExit()
-    if ($p.ExitCode -ne 0) { throw ("mysql exited {0}: {1}" -f $p.ExitCode, $err.Result.Trim()) }
+    if ($p.ExitCode -ne 0) { throw ("memdb exited {0}: {1}" -f $p.ExitCode, $err.Result.Trim()) }
     return $out.Result
 }

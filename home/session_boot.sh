@@ -1,20 +1,19 @@
 #!/bin/bash
-# session_boot.sh — One-command session startup for {{DB_NAME}}
-# Usage: bash ~/.claude/session_boot.sh [working_directory]
+# session_boot.sh — One-command session startup for claude_memory (SQLite, via memdb)
+# Usage: bash ~/.claude/session_boot.sh [--full] [working_directory]
 # Returns: session_id, project context, recent work digest, behaviours, observations, limitations
 # If working_directory not provided, uses current directory
 
-# Headless pipeline guard: a MultiAgentHarness worker (claude -p / codex exec) sets MAH_HEADLESS=1 and
-# inherits it into this hook. Such workers must NOT boot a memory session — no human, sandboxed, no DB role,
-# and it only burns their limited turn. claude -p DOES fire this SessionStart hook, so bail immediately.
+# Headless pipeline guard: an automated worker (claude -p / codex exec run by a multi-agent pipeline)
+# sets MAH_HEADLESS=1 and inherits it into this hook. Such workers must NOT boot a memory session:
+# no human is there, and it only burns their limited turn. claude -p DOES fire SessionStart, so bail.
 [ -n "$MAH_HEADLESS" ] && exit 0
-# Maintenance-automation guard (S703): headless maintenance passes over the memory DB itself (the 3-hourly
-# ClaudeMemoryConsolidation task's runner sets this) work ON the database but are not work sessions — booting
-# one created a session row nothing ever closed, the NULL-project orphan flood (~8/day at :07 past the hour).
+# Maintenance-automation guard: headless passes over the memory database itself (the scheduled
+# consolidation runner sets this) work ON the database but are not work sessions. Booting one
+# created a session row that nothing ever closed.
 [ -n "$CLAUDE_MEMORY_SKIP_BOOT" ] && exit 0
 
-MYSQL="{{MYSQL_EXE_POSIX}}"
-DB="{{DB_NAME}}"
+MEMDB="{{MEMDB_POSIX}}"
 
 # Boot depth. Slim (default) creates the session row + minimal context so the
 # automatic SessionStart hook stays cheap; --full also loads the complete
@@ -26,14 +25,22 @@ WORK_DIR="${1:-$(pwd)}"
 
 # Normalize path: backslashes to forward slashes, then convert Git Bash /c/... drive paths to c:/...
 NORM_DIR=$(echo "$WORK_DIR" | sed 's|\\|/|g' | sed -E 's|^/([a-zA-Z])(/.*)?$|\1:\2|')
+# Single quotes doubled for use inside SQL string literals (SQLite: backslashes are literal).
+SQL_DIR=$(printf '%s' "$NORM_DIR" | sed "s/'/''/g")
 
 run_sql() {
-  "$MYSQL" -u {{MYSQL_USER}} -p{{MYSQL_PASSWORD}} -N -e "USE $DB; $1" 2>/dev/null
+  "$MEMDB" -N -e "$1" 2>/dev/null
 }
 
 run_sql_with_headers() {
-  "$MYSQL" -u {{MYSQL_USER}} -p{{MYSQL_PASSWORD}} -e "USE $DB; $1" 2>/dev/null
+  "$MEMDB" -e "$1" 2>/dev/null
 }
+
+if ! "$MEMDB" -N -e "SELECT 1" >/dev/null 2>&1; then
+  echo "=== claude_memory UNAVAILABLE: $("$MEMDB" -N -e "SELECT 1" 2>&1 | head -1) ==="
+  echo "memdb: $MEMDB -- database: $("$MEMDB" --path 2>/dev/null)"
+  exit 0
+fi
 
 # --- Step 1: Resolve project from working directory ---
 # Try SVN-based matching first (works regardless of local path)
@@ -67,6 +74,7 @@ if [ $? -eq 0 ]; then
     SVN_BRANCH="unknown"
   fi
 fi
+SVN_BRANCH_SQL=$(printf '%s' "$SVN_BRANCH" | sed "s/'/''/g")
 
 # Match by SVN UUID + project path
 PROJECT_SLUG=""
@@ -74,21 +82,21 @@ if [ -n "$SVN_UUID" ]; then
   PROJECT_SLUG=$(run_sql "
     SELECT slug FROM projects WHERE is_active = 1
     AND svn_uuid = '$SVN_UUID'
-    AND svn_project_path = '$SVN_PROJECT_PATH'
+    AND svn_project_path = '$(printf '%s' "$SVN_PROJECT_PATH" | sed "s/'/''/g")'
     LIMIT 1;")
 fi
 
-# Fallback: path-based matching (exact then prefix)
+# Fallback: path-based matching (exact then longest prefix)
 if [ -z "$PROJECT_SLUG" ]; then
   PROJECT_SLUG=$(run_sql "
     SELECT slug FROM projects WHERE is_active = 1
-    AND REPLACE(LOWER(root_path), '\\\\', '/') = LOWER('$NORM_DIR')
+    AND REPLACE(LOWER(root_path), '\\', '/') = LOWER('$SQL_DIR')
     LIMIT 1;")
 fi
 if [ -z "$PROJECT_SLUG" ]; then
   PROJECT_SLUG=$(run_sql "
     SELECT slug FROM projects WHERE is_active = 1
-    AND LOWER('$NORM_DIR') LIKE CONCAT(REPLACE(LOWER(root_path), '\\\\', '/'), '%')
+    AND LOWER('$SQL_DIR') LIKE REPLACE(LOWER(root_path), '\\', '/') || '%'
     ORDER BY LENGTH(root_path) DESC LIMIT 1;")
 fi
 
@@ -106,8 +114,8 @@ fi
 
 # --- Step 2: Close orphaned active sessions ---
 ORPHANS=$(run_sql "SELECT COUNT(*) FROM sessions WHERE status = 'active';")
-if [ "$ORPHANS" -gt 0 ]; then
-  run_sql "UPDATE sessions SET status = 'abandoned', ended_at = NOW() WHERE status = 'active';"
+if [ "${ORPHANS:-0}" -gt 0 ]; then
+  run_sql "UPDATE sessions SET status = 'abandoned', ended_at = now() WHERE status = 'active';"
   echo "Closed $ORPHANS orphaned session(s)"
 fi
 
@@ -115,18 +123,19 @@ fi
 # Claude Code sets CLAUDE_CODE_SESSION_ID to the session UUID (== transcript filename stem).
 # Recording it links this DB session to its archived raw transcript (transcripts.session_uuid).
 SESSION_UUID="${CLAUDE_CODE_SESSION_ID:-}"
+case "$SESSION_UUID" in *[!0-9a-zA-Z-]*) SESSION_UUID="" ;; esac
 if [ -n "$SESSION_UUID" ]; then SUID_SQL="'$SESSION_UUID'"; else SUID_SQL="NULL"; fi
-if [ -n "$SVN_BRANCH" ]; then
-  SESSION_ID=$(run_sql "
-    INSERT INTO sessions (project_id, session_uuid, branch, started_at) VALUES ($PROJECT_ID, $SUID_SQL, '$SVN_BRANCH', NOW());
-    SELECT LAST_INSERT_ID();")
-else
-  SESSION_ID=$(run_sql "
-    INSERT INTO sessions (project_id, session_uuid, started_at) VALUES ($PROJECT_ID, $SUID_SQL, NOW());
-    SELECT LAST_INSERT_ID();")
-fi
+if [ -n "$SVN_BRANCH" ]; then BRANCH_SQL="'$SVN_BRANCH_SQL'"; else BRANCH_SQL="NULL"; fi
+SESSION_ID=$(run_sql "
+  INSERT INTO sessions (project_id, session_uuid, branch, started_at)
+  VALUES ($PROJECT_ID, $SUID_SQL, $BRANCH_SQL, now()) RETURNING id;")
 echo "=== SESSION: $SESSION_ID ==="
 echo ""
+
+# --- Step 3b: Mechanical consolidation tier (~/.claude/consolidator/tier1_mechanical.sql) ---
+# Replaces MySQL's hourly event: decay stale observations, expire past-TTL memories. The procedure
+# does real work at most once a day, so every boot after the first one of the day is a no-op.
+run_sql "CALL sp_consolidate_mechanical('boot-$(date +%Y%m%d)');" >/dev/null
 
 # --- Step 4: Recent work (age-decayed digest, OptMem-style; ~/.claude/consolidator/digest.sql) ---
 # One line per session, recent ones first; older work in rolled-up blocks [a-b] that the
@@ -136,22 +145,21 @@ DIGEST_LINES=$(run_sql "SELECT cfg_value FROM consolidation_config WHERE cfg_key
 DIGEST_LINES="${DIGEST_LINES:-16}"
 if [ "$PROJECT_ID" != "NULL" ]; then
   echo "=== RECENT WORK: $PROJECT_SLUG (newest first) ==="
-  "$MYSQL" -u {{MYSQL_USER}} -p{{MYSQL_PASSWORD}} -N -r -e "USE $DB; CALL sp_digest_cover($PROJECT_ID, $DIGEST_LINES);" 2>/dev/null
+  "$MEMDB" -N -r -e "CALL sp_digest_cover($PROJECT_ID, $DIGEST_LINES);" 2>/dev/null
 else
   echo "=== RECENT WORK BY PROJECT (newest line of each) ==="
-  "$MYSQL" -u {{MYSQL_USER}} -p{{MYSQL_PASSWORD}} -N -r -e "USE $DB;
-    SELECT display FROM v_digest_project_heads ORDER BY at DESC LIMIT $((DIGEST_LINES / 2));" 2>/dev/null
+  "$MEMDB" -N -r -e "SELECT display FROM v_digest_project_heads ORDER BY at DESC LIMIT $((DIGEST_LINES / 2));" 2>/dev/null
   echo ""
   echo "=== RECENT WORK: no project (newest first) ==="
-  "$MYSQL" -u {{MYSQL_USER}} -p{{MYSQL_PASSWORD}} -N -r -e "USE $DB; CALL sp_digest_cover(NULL, $((DIGEST_LINES / 2)));" 2>/dev/null
+  "$MEMDB" -N -r -e "CALL sp_digest_cover(NULL, $((DIGEST_LINES / 2)));" 2>/dev/null
 fi
 echo ""
 
 # --- Step 4b: Behaviours (every boot, slim or full) ---
 # The current guidance the consolidation pass derives from memories: open conflicts first,
 # then rules, then habits at or above behaviour_boot_min_strength. Small by design so it can
-# load every session -- slim boot never surfaced preferences, which is how the python rule
-# (memories 1421/1634) was broken twice without either memory ever reaching context.
+# load every session -- slim boot never surfaced preferences, so a standing rule could be broken
+# repeatedly without the memory that stated it ever reaching context.
 echo "=== BEHAVIOURS (current guidance; outranks older memories on the same subject) ==="
 if [ -n "$PROJECT_SLUG" ]; then
   BEH_FILTER="WHERE project IS NULL OR project = '$PROJECT_SLUG'"
@@ -178,7 +186,7 @@ if [ "$PROJECT_ID" != "NULL" ]; then
   run_sql_with_headers "
     SELECT id, memory_type, category, title, LEFT(content, 100) AS content
     FROM memories
-    WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > NOW())
+    WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > now())
       AND (project_id IS NULL OR project_id = $PROJECT_ID)
     ORDER BY priority ASC, memory_type, category;"
 else
@@ -186,7 +194,7 @@ else
     SELECT id, memory_type, category, title, LEFT(content, 100) AS content
     FROM memories
     WHERE is_active = 1 AND project_id IS NULL
-      AND (expires_at IS NULL OR expires_at > NOW())
+      AND (expires_at IS NULL OR expires_at > now())
     ORDER BY priority ASC, memory_type, category;"
 fi
 echo ""
@@ -217,7 +225,7 @@ fi
 
 # --- Step 8: Check if daily consolidation needed ---
 LAST_CONSOL=$(run_sql "
-  SELECT COALESCE(DATE(MAX(started_at)), '1970-01-01') FROM sessions
+  SELECT COALESCE(date(MAX(started_at)), '1970-01-01') FROM sessions
   WHERE summary LIKE '%[consolidation]%';")
 TODAY=$(date +%Y-%m-%d)
 if [ "$LAST_CONSOL" != "$TODAY" ]; then
@@ -231,9 +239,9 @@ fi
 # --- Step 8b: Memory confirmation (~/.claude/consolidator/confirm.sql) ---
 # New memories are drafts until the consolidation pass has checked them against their transcript.
 CONFIRM=$(run_sql "
-  SELECT CONCAT(COUNT(*), ' unconfirmed: ', COALESCE(SUM(status = 'ready'), 0), ' ready to check, ',
-                COALESCE(SUM(status = 'waiting'), 0), ' waiting for their transcript, ',
-                COALESCE(SUM(status = 'no_source'), 0), ' with no source to check against')
+  SELECT COUNT(*) || ' unconfirmed: ' || COALESCE(SUM(status = 'ready'), 0) || ' ready to check, ' ||
+         COALESCE(SUM(status = 'waiting'), 0) || ' waiting for their transcript, ' ||
+         COALESCE(SUM(status = 'no_source'), 0) || ' with no source to check against'
   FROM v_confirm_worklist;")
 echo "=== MEMORY CONFIRMATION: $CONFIRM ==="
 
@@ -248,9 +256,9 @@ echo ""
 echo "=== RULES (follow every response) ==="
 echo "- ALL storage goes to the database. NEVER write to .md files for memory/context/notes."
 echo "- BEFORE decisions: query memories table for relevant preferences and past work."
-echo "- DURING work: INSERT session_notes in real time. UPDATE code_entities after edits."
+echo "- DURING work: write session_notes in real time (memory skill). UPDATE code_entities after edits."
 echo "- AFTER edits: UPDATE code_entities signatures, purposes, dependencies in the DB."
-echo "- Store user preferences in memories table. Ask permission first, then INSERT."
+echo "- Store user preferences in memories table. Ask permission first, then write them."
 echo "- When the user expresses something preferential, offer to save it as a memory."
 echo "- NEVER rely on conversation context alone — query the database to verify."
 echo "- BEHAVIOURS above are the current guidance. NEVER edit or deactivate a memory to change behaviour: record a newer memory and let the consolidation pass supersede the old one. A behaviour in conflict is {{USER_NAME}}'s to settle -- raise it, do not pick a side."

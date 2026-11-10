@@ -6,31 +6,30 @@
     Copies every file listed in manifest.psd1 from the live machine into the repo, replacing the
     machine-specific values with {{TOKENS}} so the result installs anywhere:
 
-        paths            C:\Users\you\.claude, C:\Tools\consolidator, mysql.exe, the claude CLI
-        credentials      the MySQL user and password, in the patterns the scripts use them
-        database name    claude_memory (whole word only, so claude_memory_schema.sql survives)
-        your name        as the skills and SQL comments use it ("ask Damian" -> "ask {{USER_NAME}}")
+        paths       C:\Users\you\.claude, bin\memdb.exe, the database file, C:\Tools\consolidator,
+                    the claude CLI
+        your name   as the skills and SQL comments use it ("ask Alex" -> "ask {{USER_NAME}}")
 
-    It also regenerates db\seed.sql from the live seed tables listed in the manifest.
+    It regenerates db\seed.sql from the live seed tables listed in the manifest -- configuration
+    only, never sessions, notes, memories, observations or transcripts.
 
-    Afterwards it scans the exported files for anything that still looks machine-specific (your
-    Windows user name, the password, any of the paths) and exits 1 if it finds one, so a missed
-    pattern cannot slip into a commit unnoticed.
+    Then it scans every exported file for anything still machine- or work-specific and exits 1 if
+    it finds one, so a missed pattern cannot reach a commit unnoticed. Besides your Windows user
+    name, your name and the paths, it checks every term listed in tools\leak-terms.local.txt (one
+    per line; the file is git-ignored) -- put client names, project names and ticket prefixes there.
+
+    memdb's source (memdb\src) lives only in the repo, so it is not exported.
 
 .EXAMPLE
-    $env:CLAUDE_MEMORY_PASSWORD = '...'
-    powershell -NoProfile -ExecutionPolicy Bypass -File tools\export-from-live.ps1 -UserName Damian
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools\export-from-live.ps1 -UserName Alex
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $UserName,
-    [string] $MysqlUser = 'root',
-    [string] $MysqlPassword = $env:CLAUDE_MEMORY_PASSWORD,
-    [string] $DbName = 'claude_memory',
     [string] $ClaudeHome = (Join-Path $env:USERPROFILE '.claude'),
+    [string] $DbPath,
     [string] $ConsolidatorRoot = 'C:\Tools\consolidator',
     [string] $ClaudeCli = 'C:\Tools\npm\claude.cmd',
-    [string] $MysqlExe = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe',
     [string] $RepoRoot
 )
 
@@ -40,41 +39,21 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $RepoRoot) { $RepoRoot = Split-Path -Parent $here }
 . (Join-Path $here 'common.ps1')
 
-if (-not $MysqlPassword) { throw 'Pass -MysqlPassword or set CLAUDE_MEMORY_PASSWORD.' }
 $manifest = Import-PowerShellDataFile (Join-Path $RepoRoot 'manifest.psd1')
-$map = Get-TokenMap -UserName $UserName -DbName $DbName -MysqlUser $MysqlUser -MysqlPassword $MysqlPassword `
-    -MysqlExe $MysqlExe -ClaudeHome $ClaudeHome -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli
+$memdb = Join-Path $ClaudeHome 'bin\memdb.exe'
+if (-not $DbPath) { $DbPath = (Invoke-MemdbCapture -Memdb $memdb -Arguments @('--path')).Trim() }
+$map = Get-TokenMap -UserName $UserName -ClaudeHome $ClaudeHome -DbPath $DbPath `
+    -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli
 
 # ---------------------------------------------------------------------------------------------
-# Reverse substitution rules, applied in order.
+# Reverse substitution: paths (literal, case-insensitive, longest first so no path is half-replaced
+# by a shorter one), then the user's name.
 # ---------------------------------------------------------------------------------------------
 $rules = New-Object System.Collections.Generic.List[object]
-
-# 1. Paths: literal, case-insensitive, longest first so no path is half-replaced by a shorter one.
-$pathTokens = $map.Keys | Where-Object { $_ -match '_(WIN|FWD|POSIX)$' }
+$pathTokens = @($map.Keys | Where-Object { $_ -ne 'USER_NAME' })
 $pathTokens | Sort-Object { $map[$_].Length } -Descending | ForEach-Object {
     $rules.Add(@{ Pattern = [regex]::Escape($map[$_]); Replacement = "{{$_}}"; Options = 'IgnoreCase' })
 }
-
-# 2. Credentials, only in the shapes the scripts actually use them. A bare search for the password
-#    would also hit it in prose ("password" is a word), so match the surrounding syntax.
-$u  = [regex]::Escape($MysqlUser)
-$pw = [regex]::Escape($MysqlPassword)
-# (Hashtables, not nested @() arrays: PowerShell flattens @(@(a,b) @(c,d)) into one list.)
-$credRules = @(
-    @{ P = "(-u\s*)$u(\s+-p)$pw(?![A-Za-z0-9_])"; R = '${1}{{MYSQL_USER}}${2}{{MYSQL_PASSWORD}}' }  # -u <user> -p<password>
-    @{ P = "(MYSQL_PWD\s*=\s*['""])$pw(['""])";    R = '${1}{{MYSQL_PASSWORD}}${2}' }               # $env:MYSQL_PWD = '...'
-    @{ P = "(\`$pw\s*=\s*['""])$pw(['""])";        R = '${1}{{MYSQL_PASSWORD}}${2}' }               # mem.ps1 fallback
-    @{ P = "(MYSQL_PASS=['""])$pw(['""])";         R = '${1}{{MYSQL_PASSWORD}}${2}' }               # claude_scanner.sh
-    @{ P = "(MYSQL_USER=['""])$u(['""])";          R = '${1}{{MYSQL_USER}}${2}' }                   # claude_scanner.sh
-    @{ P = "('-u',\s*')$u(')";                     R = '${1}{{MYSQL_USER}}${2}' }                   # @('-u','root',...)
-)
-foreach ($r in $credRules) { $rules.Add(@{ Pattern = $r.P; Replacement = $r.R; Options = 'None' }) }
-
-# 3. Database name as a whole word, so file names such as claude_memory_schema.sql are left alone.
-$rules.Add(@{ Pattern = "(?<![A-Za-z0-9_])$([regex]::Escape($DbName))(?![A-Za-z0-9_])"; Replacement = '{{DB_NAME}}'; Options = 'None' })
-
-# 4. The user's name.
 $rules.Add(@{ Pattern = "\b$([regex]::Escape($UserName))\b"; Replacement = '{{USER_NAME}}'; Options = 'None' })
 
 function ConvertTo-Template([string] $Text) {
@@ -106,28 +85,28 @@ foreach ($set in $sets) {
 }
 
 # ---------------------------------------------------------------------------------------------
-# db\seed.sql from the live seed tables
+# db\seed.sql from the live seed tables (configuration only)
 # ---------------------------------------------------------------------------------------------
 $seed = New-Object System.Text.StringBuilder
-[void]$seed.AppendLine('-- Seed rows for a new claude_memory database. GENERATED by tools/export-from-live.ps1 from the')
-[void]$seed.AppendLine('-- live database: edit there and re-export rather than editing this file by hand.')
+[void]$seed.AppendLine('-- Seed rows for a new claude_memory database: the minimum the system needs to run, and nothing')
+[void]$seed.AppendLine('-- else. No sessions, notes, memories, observations or transcripts. GENERATED by')
+[void]$seed.AppendLine('-- tools/export-from-live.ps1 from a live database: change the live rows and re-export.')
 [void]$seed.AppendLine('-- reference_queries are refreshed on every install; config rows and the evidence scale are only')
 [void]$seed.AppendLine('-- inserted when missing, so re-installing never resets values tuned on the target machine.')
 foreach ($t in $manifest.Seed) {
-    $cols    = ($t.Columns | ForEach-Object { "``$_``" }) -join ', '
-    $quoted  = ($t.Columns | ForEach-Object { "QUOTE(``$_``)" }) -join ", ', ', "
-    $verb    = 'INSERT INTO'
-    $tail    = "';'"
-    if ($t.Mode -eq 'Ignore') { $verb = 'INSERT IGNORE INTO' }
+    $cols   = $t.Columns -join ', '
+    $quoted = ($t.Columns | ForEach-Object { "quote($_)" }) -join " || ', ' || "
+    if ($t.Mode -eq 'Ignore') { $head = "INSERT OR IGNORE INTO $($t.Table) ($cols) VALUES ("; $tail = ');' }
     else {
-        $upd  = ($t.Columns | Where-Object { $_ -ne $t.Key } | ForEach-Object { "``$_`` = VALUES(``$_``)" }) -join ', '
-        $tail = "'\n  ON DUPLICATE KEY UPDATE $upd;'"
+        $upd  = ($t.Columns | Where-Object { $_ -ne $t.Key } | ForEach-Object { "$_ = excluded.$_" }) -join ', '
+        $head = "INSERT INTO $($t.Table) ($cols) VALUES ("
+        $tail = ")`n  ON CONFLICT ($($t.Key)) DO UPDATE SET $upd;"
     }
-    $sql = "SELECT CONCAT('$verb ``$($t.Table)`` ($cols) VALUES (', $quoted, ')', $tail) FROM ``$($t.Table)`` ORDER BY ``$($t.Key)``;"
-    $rows = Invoke-MysqlCapture -MysqlExe $MysqlExe -MysqlUser $MysqlUser -MysqlPassword $MysqlPassword -Database $DbName -Sql $sql
+    $sql = "SELECT '" + $head.Replace("'", "''") + "' || " + $quoted + " || '" + $tail.Replace("'", "''") + "' FROM $($t.Table) ORDER BY $($t.Key);"
+    $rows = Invoke-MemdbCapture -Memdb $memdb -Arguments @('--db', $DbPath, '-N', '-r', '-e', $sql)
     [void]$seed.AppendLine('')
     [void]$seed.AppendLine("-- $($t.Table)")
-    [void]$seed.Append($rows)
+    [void]$seed.Append($rows.Replace("`r`n", "`n"))
     Write-Host ("  {0,-22} {1}" -f 'db\seed.sql', $t.Table)
 }
 $seedPath = Join-Path $RepoRoot 'db\seed.sql'
@@ -135,14 +114,19 @@ Write-Utf8 $seedPath (ConvertTo-Template $seed.ToString())
 $exported.Add($seedPath)
 
 # ---------------------------------------------------------------------------------------------
-# Leak scan: anything machine-specific that survived the rules above.
+# Leak scan: anything machine- or work-specific that survived the rules above.
 # ---------------------------------------------------------------------------------------------
 $leakPatterns = New-Object System.Collections.Generic.List[string]
-if ($env:USERNAME) { $leakPatterns.Add([regex]::Escape($env:USERNAME)) }
+if ($env:USERNAME) { $leakPatterns.Add('\b' + [regex]::Escape($env:USERNAME) + '\b') }
 $leakPatterns.Add("\b$([regex]::Escape($UserName))\b")
-$leakPatterns.Add("-p$pw(?![A-Za-z0-9_])")
-$leakPatterns.Add("['""=]$pw['""]")
 foreach ($k in $pathTokens) { $leakPatterns.Add([regex]::Escape($map[$k])) }
+$termsFile = Join-Path $here 'leak-terms.local.txt'
+if (Test-Path -LiteralPath $termsFile) {
+    foreach ($term in [System.IO.File]::ReadAllLines($termsFile)) {
+        $t = $term.Trim()
+        if ($t -and -not $t.StartsWith('#')) { $leakPatterns.Add('\b' + [regex]::Escape($t) + '\b') }
+    }
+}
 
 $leaks = 0
 foreach ($f in $exported) {
@@ -158,7 +142,7 @@ foreach ($f in $exported) {
     }
 }
 if ($leaks -gt 0) {
-    Write-Warning "$leaks possible leak(s): extend the rules in this script, or confirm each line is safe, before committing."
+    Write-Warning "$leaks possible leak(s): extend the rules in this script, reword the live file, or confirm each line is safe, before committing."
     exit 1
 }
 Write-Host "Exported $($exported.Count) files; leak scan clean."

@@ -1,45 +1,41 @@
 <#
-  archive_transcripts.ps1 — Lossless retention of Claude Code session transcripts.
+  archive_transcripts.ps1 - Lossless retention of Claude Code session transcripts.
 
   Sweeps ~/.claude/projects/**/*.jsonl and archives each transcript VERBATIM into
-  the {{DB_NAME}} DB:
-    - transcripts          : the whole .jsonl, zlib-compressed (COMPRESS), + metadata
+  the claude_memory database (SQLite, via memdb):
+    - transcripts          : the whole .jsonl, compressed with compress() (MySQL COMPRESS format), + metadata
     - transcript_messages  : one row per user/assistant line (uuid + byte offset/length
-                             into the UNCOMPRESSED bytes + extracted text for FULLTEXT),
+                             into the UNCOMPRESSED bytes + extracted text, full-text indexed),
                              plus one role='user' row per message {{USER_NAME}} typed while Claude
                              was working (a queued_command attachment line, see Test-HumanQueued)
 
   Idempotent: an unchanged file is skipped via a free byte-size comparison (transcripts are
-  append-only, so size is a reliable change signal; content_sha256 is still stored from the
-  loaded bytes). JSONL being append-only also means existing message byte-offsets never shift
-  as a file grows; a grown file is re-captured on the next sweep by UPDATING its transcripts
-  row IN PLACE (upsert keyed on uq_transcript_path) and re-indexing its messages. The id must
-  stay stable across re-ingest: a DELETE+reinsert would mint a new id and ON DELETE CASCADE
-  would silently destroy memory_sources back-pointers referencing the old transcript_id.
+  append-only, so size is a reliable change signal; content_sha256 is still stored). JSONL being
+  append-only also means existing message byte-offsets never shift as a file grows; a grown file
+  is re-captured on the next sweep by UPDATING its transcripts row IN PLACE (upsert on
+  source_path) and re-indexing its messages. The id must stay stable across re-ingest: a
+  DELETE+reinsert would mint a new id and ON DELETE CASCADE would silently destroy the
+  memory_sources back-pointers referencing the old transcript_id.
 
-  No Python (per environment): ConvertFrom-Json + LOAD DATA LOCAL INFILE + COMPRESS().
-  The bytes read for parsing are what gets archived: they are staged to a short %TEMP% path for
-  LOAD DATA, because mysql.exe cannot open a path of 260+ chars (deep scratch-workspace subagent
-  transcripts) and re-reading a live file could capture bytes the index never saw.
+  The bytes read for parsing are what gets archived: they are staged to a short %TEMP% path and
+  read back by memdb's readfile(), because re-reading a live file could capture bytes the index
+  never saw.
 
-  Size limit: every reader does UNCOMPRESS(raw_jsonl), which returns NULL when the uncompressed
-  transcript is larger than the server's max_allowed_packet. The server runs with
-  SET PERSIST max_allowed_packet = 1G (MySQL's ceiling); a transcript over the live limit is still
-  archived (retention comes first) but warned about, since nothing can read it back until raised.
+  Size limit: SQLite holds values up to ~1 GB; a transcript over 900 MB is skipped with a warning.
 
   -Reindex rebuilds transcript_messages for transcripts ALREADY archived, parsing the archived
   bytes (the .jsonl may be long gone) - use it after changing what Parse-Bytes indexes. It never
   touches raw_jsonl or transcripts.id, and skips a transcript a concurrent sweep re-ingested
-  after it was read (content_sha256 checked under a row lock).
+  after it was read (content_sha256 checked inside the write transaction).
 
   Usage:
     powershell -NoProfile -File archive_transcripts.ps1
-    powershell -NoProfile -File archive_transcripts.ps1 -Only ScratchML -MaxFiles 2
-    powershell -NoProfile -Command "& 'archive_transcripts.ps1' -Reindex -Ids 12492,12551"
+    powershell -NoProfile -File archive_transcripts.ps1 -Only ScratchProject -MaxFiles 2
+    powershell -NoProfile -Command "& 'archive_transcripts.ps1' -Reindex -Ids 12,51"
 #>
 [CmdletBinding()]
 param(
-  [string]$ProjectsRoot = (Join-Path $HOME '.claude\projects'),
+  [string]$ProjectsRoot = '{{CLAUDE_HOME_WIN}}\projects',
   [string]$Only        = $null,   # only process source paths containing this substring (testing)
   [int]   $MaxFiles    = 0,       # 0 = no limit (testing)
   [int]   $MsgTextCap  = 16000,   # cap stored msg_text length (raw blob keeps the full content)
@@ -50,43 +46,41 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false   # decode memdb's output as UTF-8
 
-$MysqlExe = '{{MYSQL_EXE_WIN}}'
-if (-not (Test-Path -LiteralPath $MysqlExe)) { throw "mysql.exe not found at $MysqlExe" }
-$env:MYSQL_PWD = '{{MYSQL_PASSWORD}}'   # pass password via env so mysql does not emit the insecure-password stderr warning
-$BaseArgs  = @('-u','{{MYSQL_USER}}','--default-character-set=utf8mb4','{{DB_NAME}}')
-$LocalArgs = @('--local-infile=1') + $BaseArgs
+$Memdb = '{{MEMDB_WIN}}'
+if (-not (Test-Path -LiteralPath $Memdb)) { throw "memdb.exe not found at $Memdb" }
+$MaxBytes = 900MB
 
-function Invoke-Mysql([string[]]$mysqlArgs, [string]$stdin = $null) {
+function Invoke-Memdb([string[]]$memdbArgs, [string]$stdin = $null) {
   # PS 5.1: relax EAP around the native call so a stray stderr line is not promoted to a terminating error.
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
-    if ($null -ne $stdin) { $out = $stdin | & $MysqlExe @mysqlArgs 2>&1 }
-    else                  { $out =          & $MysqlExe @mysqlArgs 2>&1 }
+    if ($null -ne $stdin) { $out = $stdin | & $Memdb @memdbArgs 2>&1 }
+    else                  { $out =          & $Memdb @memdbArgs 2>&1 }
   } finally { $ErrorActionPreference = $eap }
-  if ($LASTEXITCODE -ne 0) { throw ("mysql failed (exit $LASTEXITCODE): " + (($out | ForEach-Object { $_.ToString() }) -join "`n")) }
+  if ($LASTEXITCODE -ne 0) { throw ("memdb failed (exit $LASTEXITCODE): " + (($out | ForEach-Object { $_.ToString() }) -join "`n")) }
   return $out
 }
-function Run-Sql([string[]]$extraArgs, [string]$sql) { return (Invoke-Mysql $extraArgs $sql) }
-function Run-SqlFile([string[]]$extraArgs, [string]$file) {
-  $fwd = $file.Replace('\','/')
-  return (Invoke-Mysql ($extraArgs + @('-e',"SOURCE $fwd")))
-}
+function Run-Sql([string]$sql) { return (Invoke-Memdb @('-N', '-r') $sql) }
+function Run-SqlFile([string]$file) { return (Invoke-Memdb @('-N', '-r', '-f', $file)) }
 
-function Esc([string]$s) {
-  # Escape a value for a single-quoted MySQL string literal (default sql_mode: backslash is an escape).
-  if ($null -eq $s) { return $null }
-  return $s.Replace('\','\\').Replace("'","\'")
+function SqlStr($s) {
+  # SQLite string literal: a single quote is doubled; backslashes are literal. NUL cannot appear in SQL text.
+  if ($null -eq $s) { return 'NULL' }
+  return "'" + ([string]$s).Replace([string][char]0, '').Replace("'", "''") + "'"
 }
-function SqlStr($s)  { if ($null -eq $s) { 'NULL' } else { "'" + (Esc $s) + "'" } }
 function SqlDate($s) { if ([string]::IsNullOrWhiteSpace($s)) { 'NULL' } else { "'" + ($s.Substring(0,[Math]::Min(19,$s.Length)).Replace('T',' ')) + "'" } }
 
 function Read-BytesShared([string]$path) {
   # Shared read so an actively-appending writer (a live session) cannot block the sweep.
   $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
   $ms = $null
-  try { $ms = New-Object System.IO.MemoryStream; $fs.CopyTo($ms); return ,$ms.ToArray() }   # comma: see Read-ArchivedBytes
+  try { $ms = New-Object System.IO.MemoryStream; $fs.CopyTo($ms); return ,$ms.ToArray() }   # comma: stops PowerShell unrolling the array
   finally { $fs.Dispose(); if ($ms) { $ms.Dispose() } }
+}
+function Get-Sha256([byte[]]$bytes) {
+  return [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant()
 }
 function Get-MsgText($content) {
   if ($null -eq $content) { return $null }
@@ -104,10 +98,10 @@ function Get-MsgText($content) {
   return ($parts -join "`n")
 }
 function Test-HumanQueued($o) {
-  # A message {{USER_NAME}} types while Claude is working is not a user line: Claude Code stores it as an
+  # A message the user types while Claude is working is not a user line: Claude Code stores it as an
   # attachment line of type queued_command with the text in attachment.prompt. Task notifications and
   # messages from other sessions share that type but carry origin.kind task-notification/peer/coordinator
-  # (or, in older versions, commandMode task-notification and no origin); only kind 'human' is {{USER_NAME}}.
+  # (or, in older versions, commandMode task-notification and no origin); only kind 'human' is the user.
   return ($o.type -eq 'attachment' -and $o.attachment -and $o.attachment.type -eq 'queued_command' -and
           $o.attachment.origin -and $o.attachment.origin.kind -eq 'human')
 }
@@ -167,36 +161,22 @@ function Add-MessageInserts([System.Text.StringBuilder]$sb, [string]$table, [str
   if ($msgs.Count -gt 0) { [void]$sb.AppendLine(";") }
 }
 
-function Read-ArchivedBytes([int]$id, [long]$size, [string]$sha) {
-  # The archived, uncompressed bytes of one transcript. mysql.exe output reaches PowerShell as decoded
-  # text, so the blob comes back as base64 in chunks that each fit one packet; the SHA-256 check also
-  # catches a blob UNCOMPRESS cannot return (larger than max_allowed_packet comes back NULL).
-  $chunk = 8MB
-  $sql = New-Object System.Text.StringBuilder
-  [void]$sql.AppendLine("SET @b := (SELECT IF(is_compressed, UNCOMPRESS(raw_jsonl), raw_jsonl) FROM transcripts WHERE id = $id);")
-  for ($off = 0; $off -lt $size; $off += $chunk) {
-    [void]$sql.AppendLine("SELECT REPLACE(TO_BASE64(SUBSTRING(@b, $($off + 1), $chunk)), '\n', '');")
-  }
-  $ms = New-Object System.IO.MemoryStream
+function Read-ArchivedBytes([int]$id, [string]$sha) {
+  # The archived, uncompressed bytes of one transcript: memdb writes them to a temp file, and the
+  # SHA-256 check proves they round-tripped.
+  $tmp = Join-Path $env:TEMP ("cm_reindex_{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
   try {
-    foreach ($line in (Run-Sql ($BaseArgs + @('--batch','--skip-column-names','--max-allowed-packet=64M')) $sql.ToString())) {
-      if ($line -isnot [string]) { continue }   # a stderr record, not data
-      $b = [Convert]::FromBase64String($line); $ms.Write($b, 0, $b.Length)
-    }
-    $bytes = $ms.ToArray()
-  } finally { $ms.Dispose() }
-  $got = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant()
-  if ($got -ne $sha) { throw "archived bytes did not round-trip (got $($bytes.Length) of $size bytes; sha mismatch)" }
-  return ,$bytes   # the comma stops PowerShell unrolling the array into boxed objects
+    Run-Sql ("SELECT writefile($(SqlStr $tmp), IIF(is_compressed, uncompress(raw_jsonl), raw_jsonl)) FROM transcripts WHERE id = $id;") | Out-Null
+    $bytes = [System.IO.File]::ReadAllBytes($tmp)
+  } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+  $got = Get-Sha256 $bytes
+  if ($got -ne $sha) { throw "archived bytes did not round-trip (got $($bytes.Length) bytes; sha mismatch)" }
+  return ,$bytes
 }
 
 try {
 Write-Host "=== archive_transcripts: sweeping $ProjectsRoot ==="
 if (-not (Test-Path -LiteralPath $ProjectsRoot)) { throw "Projects root not found: $ProjectsRoot" }
-
-# Enable local_infile once for this run (LOAD DATA LOCAL needs server + client both on).
-Run-Sql $LocalArgs "SET GLOBAL local_infile = 1;" | Out-Null
-$maxPacket = [long]((Run-Sql ($BaseArgs + @('--batch','--skip-column-names')) "SELECT @@global.max_allowed_packet;") | Where-Object { $_ -is [string] } | Select-Object -First 1)
 
 # Staged copies a killed run (hook timeout) left behind; an hour old so a concurrent sweep's are spared.
 Get-ChildItem -LiteralPath $env:TEMP -File -Filter 'cm_*' -ErrorAction SilentlyContinue |
@@ -206,38 +186,38 @@ Get-ChildItem -LiteralPath $env:TEMP -File -Filter 'cm_*' -ErrorAction SilentlyC
 if ($Reindex) {
   # Rebuild the message index of already-archived transcripts from their archived bytes. raw_jsonl and
   # transcripts.id are untouched, so memory_sources (keyed on message uuids) keep resolving; seq values
-  # may shift. Only message_count is refreshed: first/last_message_at feed the digest's "active again"
-  # check (v_digest_sessions) and stay as the last ingest set them.
+  # may shift. Only message_count is refreshed (updated_at is kept): first/last_message_at feed the
+  # digest's "active again" check (v_digest_sessions) and stay as the last ingest set them.
   $where = New-Object System.Collections.Generic.List[string]
   if ($Ids.Count) { [void]$where.Add("id IN (" + ($Ids -join ',') + ")") }
-  if ($Only)      { [void]$where.Add("LOCATE($(SqlStr $Only), source_path) > 0") }
-  $q = "SELECT id, byte_size, content_sha256 FROM transcripts" + $(if ($where.Count) { " WHERE " + ($where -join ' AND ') } else { '' }) + " ORDER BY id;"
+  if ($Only)      { [void]$where.Add("instr(source_path, $(SqlStr $Only)) > 0") }
+  $q = "SELECT id, content_sha256 FROM transcripts" + $(if ($where.Count) { " WHERE " + ($where -join ' AND ') } else { '' }) + " ORDER BY id;"
   $done=0; $skipped=0; $errors=0; $msgTotal=0
-  foreach ($line in (Run-Sql ($BaseArgs + @('--batch','--skip-column-names')) $q)) {
+  foreach ($line in (Run-Sql $q)) {
     if ($line -isnot [string] -or [string]::IsNullOrWhiteSpace($line)) { continue }
-    $id,$size,$sha = $line.Trim() -split "`t",3
+    $id,$sha = $line.Trim() -split "`t",2
     try {
-      $msgs = (Parse-Bytes (Read-ArchivedBytes ([int]$id) ([long]$size) $sha)).Messages
+      $msgs = (Parse-Bytes (Read-ArchivedBytes ([int]$id) $sha)).Messages
       # Stage the rows, then swap them in only if the transcript still holds the bytes just parsed: a
       # concurrent sweep that re-ingested a grown file in the meantime has already indexed it.
       $sb = New-Object System.Text.StringBuilder
-      [void]$sb.AppendLine("CREATE TEMPORARY TABLE _cm_stage_msgs AS SELECT transcript_id, seq, message_uuid, parent_uuid, role, byte_offset, byte_length, line_number, ts, msg_text FROM transcript_messages LIMIT 0;")
+      [void]$sb.AppendLine("CREATE TEMP TABLE _cm_stage_msgs AS SELECT transcript_id, seq, message_uuid, parent_uuid, role, byte_offset, byte_length, line_number, ts, msg_text FROM transcript_messages LIMIT 0;")
       Add-MessageInserts $sb '_cm_stage_msgs' $id $msgs
       [void]$sb.AppendLine(@"
-START TRANSACTION;
-SET @tid := NULL;
-SELECT id INTO @tid FROM transcripts WHERE id = $id AND content_sha256 = $(SqlStr $sha) FOR UPDATE;
-DELETE FROM transcript_messages WHERE transcript_id = @tid;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE _cm_tid AS SELECT id, updated_at FROM transcripts WHERE id = $id AND content_sha256 = $(SqlStr $sha);
+DELETE FROM transcript_messages WHERE transcript_id IN (SELECT id FROM _cm_tid);
 INSERT INTO transcript_messages (transcript_id, seq, message_uuid, parent_uuid, role, byte_offset, byte_length, line_number, ts, msg_text)
   SELECT transcript_id, seq, message_uuid, parent_uuid, role, byte_offset, byte_length, line_number, ts, msg_text
-  FROM _cm_stage_msgs WHERE @tid IS NOT NULL;
-UPDATE transcripts SET message_count = $($msgs.Count), updated_at = updated_at WHERE id = @tid;
+  FROM _cm_stage_msgs WHERE EXISTS (SELECT 1 FROM _cm_tid);
+UPDATE transcripts SET message_count = $($msgs.Count) WHERE id IN (SELECT id FROM _cm_tid);
+UPDATE transcripts SET updated_at = (SELECT updated_at FROM _cm_tid) WHERE id IN (SELECT id FROM _cm_tid);
 COMMIT;
-SELECT @tid IS NOT NULL;
+SELECT COUNT(*) FROM _cm_tid;
 "@)
       $tmp = Join-Path $env:TEMP ("cm_reindex_{0}.sql" -f ([guid]::NewGuid().ToString('N')))
       [System.IO.File]::WriteAllText($tmp, $sb.ToString(), (New-Object System.Text.UTF8Encoding $false))
-      try { $out = Run-SqlFile ($BaseArgs + @('--batch','--skip-column-names')) $tmp } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+      try { $out = Run-SqlFile $tmp } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
       if ((@($out | Where-Object { $_ -is [string] }) | Select-Object -Last 1) -eq '1') {
         $done++; $msgTotal += $msgs.Count
         Write-Host ("  ~ transcript {0}  msgs={1}" -f $id, $msgs.Count)
@@ -255,18 +235,18 @@ SELECT @tid IS NOT NULL;
   return
 }
 
-# Existing (source_path -> sha) for skip detection.
+# Existing (source_path -> size) for skip detection.
 $existing = @{}
-foreach ($line in (Run-Sql ($BaseArgs + @('--batch','--skip-column-names')) "SELECT source_path, byte_size FROM transcripts;")) {
-  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+foreach ($line in (Run-Sql "SELECT source_path, byte_size FROM transcripts;")) {
+  if ($line -isnot [string] -or [string]::IsNullOrWhiteSpace($line)) { continue }
   $p,$sz = $line -split "`t",2
   $existing[$p] = [long]$sz
 }
 
-# Map Claude Code session UUID -> DB session id (session_boot.sh records session_uuid going forward).
+# Map Claude Code session UUID -> DB session id (session_boot.sh records session_uuid).
 $sessByUuid = @{}
-foreach ($line in (Run-Sql ($BaseArgs + @('--batch','--skip-column-names')) "SELECT session_uuid, id FROM sessions WHERE session_uuid IS NOT NULL;")) {
-  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+foreach ($line in (Run-Sql "SELECT session_uuid, id FROM sessions WHERE session_uuid IS NOT NULL;")) {
+  if ($line -isnot [string] -or [string]::IsNullOrWhiteSpace($line)) { continue }
   $u,$sid = $line -split "`t",2
   $sessByUuid[$u] = [int]$sid
 }
@@ -280,6 +260,11 @@ foreach ($f in $files) {
   try {
     # Fast skip: transcripts are append-only, so an unchanged file keeps the same byte size.
     if ($existing.ContainsKey($fullFwd) -and $existing[$fullFwd] -eq $f.Length) { $skipped++; continue }
+    if ($f.Length -gt $MaxBytes) {
+      $errors++
+      Write-Warning ("  ! {0}: {1:N0} MB is over the {2:N0} MB limit for one SQLite value; not archived" -f $f.Name, ($f.Length / 1MB), ($MaxBytes / 1MB))
+      continue
+    }
     $bytes = Read-BytesShared $f.FullName
     # Never replace archived content with nothing (a 0-byte file has nothing to retain).
     if ($bytes.Length -eq 0) { $skipped++; continue }
@@ -300,56 +285,43 @@ foreach ($f in $files) {
     $rawTmp  = Join-Path $env:TEMP "cm_raw_$guid.jsonl"
     $tmp     = Join-Path $env:TEMP "cm_ingest_$guid.sql"
 
-    # Raw blob + metadata + message index, as ONE transactional script over ONE
-    # connection (UTF-8 no-BOM temp file + SOURCE). The raw bytes (the ones parsed
-    # above, written to $rawTmp) are staged with LOAD DATA LOCAL into a temp table,
-    # then UPSERTed into transcripts keyed on
-    # uq_transcript_path: a re-ingested (grown) file UPDATES ITS ROW IN PLACE,
-    # keeping transcripts.id stable. Never DELETE+reinsert here — the cascade on
-    # fk_src_transcript would destroy memory_sources back-pointers (message uuids
-    # and byte offsets are append-only-stable, so surviving pointers stay valid).
-    # transcript_messages have no inbound FKs and are simply re-indexed.
+    # Raw blob + metadata + message index as ONE transaction. The raw bytes (the ones parsed above,
+    # written to $rawTmp) are read back by readfile() and compressed inside SQLite, then UPSERTed
+    # keyed on source_path: a re-ingested (grown) file UPDATES ITS ROW IN PLACE, keeping
+    # transcripts.id stable. Never DELETE+reinsert here - the cascade on memory_sources would
+    # destroy back-pointers (message uuids and byte offsets are append-only-stable, so surviving
+    # pointers stay valid). transcript_messages have no inbound FKs and are simply re-indexed.
+    $tidExpr = "(SELECT id FROM transcripts WHERE source_path = $pathLit)"
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine(@"
-CREATE TEMPORARY TABLE _cm_stage_raw (raw LONGBLOB NOT NULL);
-LOAD DATA LOCAL INFILE $(SqlStr $rawTmp.Replace('\','/'))
-  INTO TABLE _cm_stage_raw
-  FIELDS TERMINATED BY '\0' ESCAPED BY ''
-  LINES TERMINATED BY '\0'
-  (@raw)
-  SET raw = @raw;
-START TRANSACTION;
+BEGIN IMMEDIATE;
 INSERT INTO transcripts
   (raw_jsonl, is_compressed, byte_size, content_sha256, session_uuid, kind,
    parent_session_uuid, source_path, project_id, session_id, line_count,
    message_count, first_message_at, last_message_at)
-SELECT COMPRESS(raw), 1, LENGTH(raw), SHA2(raw, 256), $(SqlStr $sessionUuid), '$kind',
+SELECT compress(r), 1, $($bytes.Length), $(SqlStr (Get-Sha256 $bytes)), $(SqlStr $sessionUuid), '$kind',
        $(SqlStr $parent), $pathLit, NULL, $sessId, $($parsed.TotalLines),
        $($msgs.Count), $(SqlDate $first), $(SqlDate $last)
-  FROM _cm_stage_raw
-ON DUPLICATE KEY UPDATE
-  raw_jsonl = VALUES(raw_jsonl), is_compressed = VALUES(is_compressed),
-  byte_size = VALUES(byte_size), content_sha256 = VALUES(content_sha256),
-  session_uuid = VALUES(session_uuid), kind = VALUES(kind),
-  parent_session_uuid = VALUES(parent_session_uuid), session_id = VALUES(session_id),
-  line_count = VALUES(line_count), message_count = VALUES(message_count),
-  first_message_at = VALUES(first_message_at), last_message_at = VALUES(last_message_at);
-SET @tid := (SELECT id FROM transcripts WHERE source_path = $pathLit);
-DELETE FROM transcript_messages WHERE transcript_id = @tid;
+  FROM (SELECT readfile($(SqlStr $rawTmp)) AS r) WHERE r IS NOT NULL
+ON CONFLICT (source_path) DO UPDATE SET
+  raw_jsonl = excluded.raw_jsonl, is_compressed = excluded.is_compressed,
+  byte_size = excluded.byte_size, content_sha256 = excluded.content_sha256,
+  session_uuid = excluded.session_uuid, kind = excluded.kind,
+  parent_session_uuid = excluded.parent_session_uuid, session_id = excluded.session_id,
+  line_count = excluded.line_count, message_count = excluded.message_count,
+  first_message_at = excluded.first_message_at, last_message_at = excluded.last_message_at;
+DELETE FROM transcript_messages WHERE transcript_id = $tidExpr;
 "@)
-    Add-MessageInserts $sb 'transcript_messages' '@tid' $msgs
+    Add-MessageInserts $sb 'transcript_messages' $tidExpr $msgs
     [void]$sb.AppendLine("COMMIT;")
     try {
       [System.IO.File]::WriteAllBytes($rawTmp, $bytes)
       [System.IO.File]::WriteAllText($tmp, $sb.ToString(), (New-Object System.Text.UTF8Encoding $false))
-      Run-SqlFile $LocalArgs $tmp | Out-Null
+      Run-SqlFile $tmp | Out-Null
     } finally { Remove-Item -LiteralPath $rawTmp, $tmp -ErrorAction SilentlyContinue }
 
     $ingested++; $msgTotal += $msgs.Count
     Write-Host ("  + {0}  [{1}]  lines={2} msgs={3}" -f $f.Name, $kind, $parsed.TotalLines, $msgs.Count)
-    if ($bytes.Length -gt $maxPacket) {
-      Write-Warning ("  ! {0}: archived, but {1:N0} MB is over max_allowed_packet ({2:N0} MB) - UNCOMPRESS(raw_jsonl) returns NULL for it until that is raised" -f $f.Name, ($bytes.Length / 1MB), ($maxPacket / 1MB))
-    }
     if ($MaxFiles -gt 0 -and $ingested -ge $MaxFiles) { break }
   } catch {
     $errors++
@@ -359,7 +331,7 @@ DELETE FROM transcript_messages WHERE transcript_id = @tid;
 
 Write-Host ("=== done: seen={0} ingested={1} skipped(unchanged)={2} errors={3} messages_indexed={4} ===" -f $seen,$ingested,$skipped,$errors,$msgTotal)
 } catch {
-  # Never disrupt a session start/end: log and exit clean even if (e.g.) MySQL is momentarily down.
+  # Never disrupt a session start/end: log and exit clean even if (e.g.) the database is locked.
   Write-Warning ("archive_transcripts aborted: " + $_.Exception.Message)
   exit 0
 }
