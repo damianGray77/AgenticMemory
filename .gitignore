@@ -1,0 +1,7 @@
+# Never commit rendered files, dumps or credentials.
+*.my.cnf
+.my.cnf
+*.dump.sql
+*_data.sql
+logs/
+runs/

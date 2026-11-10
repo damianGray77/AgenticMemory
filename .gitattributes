@@ -1,0 +1,12 @@
+* text=auto
+
+# Git Bash scripts must be LF on every platform.
+*.sh   text eol=lf
+
+# Windows PowerShell scripts and data files.
+*.ps1  text eol=crlf
+*.psd1 text eol=crlf
+
+*.sql  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
