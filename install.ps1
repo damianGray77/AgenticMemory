@@ -3,58 +3,54 @@
     Install the claude_memory system into a Claude Code installation on Windows.
 
 .DESCRIPTION
-    Fills the {{TOKENS}} in this repo's templates with this machine's values and installs:
+    Nothing to download and no database server: the database is a single SQLite file, driven by
+    memdb.exe, which this script compiles from memdb\src with the C# compiler that ships with
+    Windows, on top of the SQLite engine that also ships with Windows (winsqlite3.dll).
 
-      1. Files      home\*                -> the Claude config folder (~\.claude)
+      1. memdb      compile memdb.exe into <ClaudeHome>\bin
+      2. Files      home\*                -> the Claude config folder (~\.claude)
                     consolidator-runner\* -> the consolidation runner folder (C:\Tools\consolidator)
-      2. Database   the claude_memory database: tables, seed rows, stored procedures, views, and
-                    the hourly mechanical-consolidation event
-      3. Settings   SessionStart/SessionEnd hooks in ~\.claude\settings.json, and Claude Code's
+      3. Database   create or update the database file: tables, full-text indexes, seed rows, views
+      4. Settings   SessionStart/SessionEnd hooks in ~\.claude\settings.json, and Claude Code's
                     built-in auto memory turned off (the database replaces it)
-      4. Optional   the 3-hourly judgment-tier consolidation task (-RegisterConsolidationTask)
+      5. Optional   the 3-hourly judgment-tier consolidation task (-RegisterConsolidationTask)
 
     Safe to re-run, which is also how you upgrade: a file that would change is backed up first to
-    ~\.claude\backups\claude-memory-install-<stamp>\, tables are only created when missing,
-    procedures, views and the event are replaced, and existing config rows are kept.
+    ~\.claude\backups\claude-memory-install-<stamp>\, tables are only created when missing, views
+    are replaced, reference queries refreshed, and existing config rows kept.
 
 .PARAMETER UserName
     Your name as the skills should use it ("ask <name>", "<name>'s decisions").
 
-.PARAMETER MysqlPassword
-    Password for -MysqlUser. If omitted: $env:CLAUDE_MEMORY_PASSWORD, else a prompt. It is written
-    into the installed scripts, as on the original machine, so use a local-only MySQL account.
+.PARAMETER DbPath
+    Where the database file lives. Default: <ClaudeHome>\claude_memory.db.
 
 .PARAMETER WireSessionClose
     Also add session_close.sh as a SessionEnd hook, so a session's row is marked completed when it
-    ends instead of being swept to 'abandoned' by the next boot. Off by default, matching the
-    original machine (where it is wired only for Codex).
+    ends instead of being swept to 'abandoned' by the next boot.
 
 .PARAMETER RegisterConsolidationTask
     Register the Windows scheduled task that runs the consolidate-memory-db skill headless every
     3 hours. Needs the claude CLI at a path a scheduled task can reach (-ClaudeCli).
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -UserName Damian
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -UserName Alex
 
 .EXAMPLE
-    .\install.ps1 -UserName Damian -RegisterConsolidationTask -ClaudeCli C:\Tools\npm\claude.cmd
+    .\install.ps1 -UserName Alex -RegisterConsolidationTask -ClaudeCli C:\Tools\npm\claude.cmd
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $UserName,
-    [string] $MysqlUser = 'root',
-    [string] $MysqlPassword,
-    [string] $DbName = 'claude_memory',
     [string] $ClaudeHome = (Join-Path $env:USERPROFILE '.claude'),
+    [string] $DbPath,
     [string] $ConsolidatorRoot = 'C:\Tools\consolidator',
     [string] $ClaudeCli,
-    [string] $MysqlExe,
     [switch] $WireSessionClose,
     [switch] $RegisterConsolidationTask,
     [string] $TaskName = 'ClaudeMemoryConsolidation',
     [switch] $SkipFiles,
     [switch] $SkipDatabase,
-    [switch] $SkipServerSettings,
     [switch] $SkipSettings
 )
 
@@ -64,6 +60,9 @@ $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $manifest = Import-PowerShellDataFile (Join-Path $repo 'manifest.psd1')
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backupRoot = Join-Path $ClaudeHome "backups\claude-memory-install-$stamp"
+$ClaudeHome = $ClaudeHome.TrimEnd('\', '/')
+if (-not $DbPath) { $DbPath = Join-Path $ClaudeHome 'claude_memory.db' }
+$memdb = Join-Path $ClaudeHome 'bin\memdb.exe'
 
 function Write-Step([string] $Message) { Write-Host ''; Write-Host "== $Message" -ForegroundColor Cyan }
 function Write-Item([string] $State, [string] $What) { Write-Host ("   {0,-10} {1}" -f $State, $What) }
@@ -73,33 +72,9 @@ function Write-Item([string] $State, [string] $What) { Write-Host ("   {0,-10} {
 # =============================================================================================
 Write-Step 'Checking inputs'
 
-# Each value is written verbatim into SQL literals, bash and PowerShell, so restrict the alphabet
-# rather than try to escape for all three.
+# The name is written into SQL string literals and prose; keep its alphabet simple.
 if ($UserName -notmatch '^[A-Za-z][A-Za-z .-]*$') { throw '-UserName: letters, spaces, dots and hyphens only.' }
-if ($DbName -notmatch '^[A-Za-z0-9_]+$')        { throw '-DbName: letters, digits and underscores only.' }
-if ($MysqlUser -notmatch '^[A-Za-z0-9_.-]+$')   { throw '-MysqlUser: letters, digits, _ . - only.' }
-
-if (-not $MysqlPassword) { $MysqlPassword = $env:CLAUDE_MEMORY_PASSWORD }
-if (-not $MysqlPassword) {
-    $secure = Read-Host "MySQL password for '$MysqlUser'" -AsSecureString
-    $MysqlPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
-}
-if ($MysqlPassword -notmatch '^[A-Za-z0-9_.@#%^+=~,:-]+$') {
-    throw 'The MySQL password ends up unquoted in bash and PowerShell commands. Use only letters, digits and _ . @ # % ^ + = ~ , : -'
-}
-
-if (-not $MysqlExe) {
-    $found = Get-ChildItem 'C:\Program Files\MySQL\MySQL Server *\bin\mysql.exe' -ErrorAction SilentlyContinue |
-        Sort-Object FullName -Descending | Select-Object -First 1
-    if ($found) { $MysqlExe = $found.FullName }
-    else {
-        $cmd = Get-Command mysql.exe -ErrorAction SilentlyContinue
-        if ($cmd) { $MysqlExe = $cmd.Source }
-    }
-}
-if (-not $MysqlExe -or -not (Test-Path -LiteralPath $MysqlExe)) { throw 'mysql.exe not found. Install MySQL Server 8.0, or pass -MysqlExe.' }
-Write-Item 'mysql' $MysqlExe
+if ($DbPath -match "'") { throw '-DbPath must not contain a single quote.' }
 
 if (-not $ClaudeCli) {
     foreach ($name in @('claude.exe', 'claude.cmd')) {
@@ -122,11 +97,11 @@ if (-not $bash -and -not (Test-Path 'C:\Program Files\Git\bin\bash.exe')) {
     Write-Warning 'bash not found. The session boot hook and the scanner need Git for Windows (Git Bash).'
 }
 
-$map = Get-TokenMap -UserName $UserName -DbName $DbName -MysqlUser $MysqlUser -MysqlPassword $MysqlPassword `
-    -MysqlExe $MysqlExe -ClaudeHome $ClaudeHome -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli
+$map = Get-TokenMap -UserName $UserName -ClaudeHome $ClaudeHome -DbPath $DbPath `
+    -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli
 Write-Item 'home' $map.CLAUDE_HOME_WIN
+Write-Item 'database' $map.DB_PATH_WIN
 Write-Item 'runner' $map.CONSOLIDATOR_ROOT_WIN
-Write-Item 'database' $DbName
 
 # =============================================================================================
 # Rendering
@@ -161,8 +136,8 @@ function Set-InstalledFile([string] $Target, [string] $Text, [string] $Root) {
 }
 
 # CLAUDE.md may already hold someone's own instructions. Keep them: the rules go in a marked block
-# that a re-install replaces in place. A CLAUDE.md that IS the rules (the original layout, or a
-# previous install into an empty folder) is simply replaced.
+# that a re-install replaces in place. A CLAUDE.md that IS the rules (an earlier install into an
+# empty folder) is simply replaced.
 $blockBegin = '<!-- BEGIN claude-memory rules (managed by install.ps1) -->'
 $blockEnd   = '<!-- END claude-memory rules -->'
 function Merge-ClaudeMd([string] $Target, [string] $Rules) {
@@ -178,7 +153,52 @@ function Merge-ClaudeMd([string] $Target, [string] $Rules) {
 }
 
 # =============================================================================================
-# 1. Files
+# 1. memdb
+# =============================================================================================
+if (-not $SkipFiles -or -not (Test-Path -LiteralPath $memdb)) {
+    Write-Step "Compiling memdb.exe into $(Split-Path -Parent $memdb)"
+    # csc stamps every build differently, so compare the SOURCE: an unchanged memdb.exe is left alone
+    # (replacing it would also fail while another session is running it).
+    $srcText = (@(Get-ChildItem -LiteralPath (Join-Path $repo 'memdb\src') -Filter *.cs | Sort-Object Name) +
+                @(Get-Item -LiteralPath (Join-Path $repo 'memdb\build.ps1')) |
+                ForEach-Object { $_.Name + "`n" + (Read-Utf8 $_.FullName) }) -join "`n"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $srcHash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($srcText)) | ForEach-Object { $_.ToString('x2') })
+    $hashFile = Join-Path (Split-Path -Parent $memdb) 'memdb.srchash'
+    $oldHash = if (Test-Path -LiteralPath $hashFile) { (Read-Utf8 $hashFile).Trim() } else { '' }
+    if ((Test-Path -LiteralPath $memdb) -and $oldHash -eq $srcHash) {
+        Write-Item 'unchanged' 'bin\memdb.exe'
+    } else {
+        $built = Join-Path $env:TEMP "claude-memory-memdb-$stamp.exe"
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'memdb\build.ps1') -OutFile $built | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $built)) { throw 'memdb build failed; run memdb\build.ps1 to see the compiler output.' }
+        try {
+            if (Test-Path -LiteralPath $memdb) {
+                Save-Backup $memdb $ClaudeHome
+                try { Copy-Item -LiteralPath $built -Destination $memdb -Force }
+                catch { throw "Could not replace $memdb (is a memdb command still running?). Close it and re-run. $_" }
+                Write-Item 'updated' 'bin\memdb.exe'
+            } else {
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $memdb) | Out-Null
+                Copy-Item -LiteralPath $built -Destination $memdb -Force
+                Write-Item 'created' 'bin\memdb.exe'
+            }
+            Write-Utf8 $hashFile ($srcHash + "`n")
+        } finally { Remove-Item -LiteralPath $built -ErrorAction SilentlyContinue }
+    }
+
+    # memdb finds the database next to its bin folder unless told otherwise.
+    $defaultDb = [System.IO.Path]::GetFullPath((Join-Path $ClaudeHome 'claude_memory.db'))
+    $pathFile = Join-Path (Split-Path -Parent $memdb) 'memdb.dbpath'
+    if ([System.IO.Path]::GetFullPath($DbPath) -ne $defaultDb) {
+        Write-Item (Set-InstalledFile $pathFile ("# database used by memdb.exe (written by install.ps1)`n" + $DbPath + "`n") $ClaudeHome) 'bin\memdb.dbpath'
+    } elseif (Test-Path -LiteralPath $pathFile) {
+        Save-Backup $pathFile $ClaudeHome; Remove-Item -LiteralPath $pathFile; Write-Item 'removed' 'bin\memdb.dbpath'
+    }
+}
+
+# =============================================================================================
+# 2. Files
 # =============================================================================================
 if (-not $SkipFiles) {
     Write-Step "Installing files into $($map.CLAUDE_HOME_WIN)"
@@ -198,58 +218,57 @@ if (-not $SkipFiles) {
 }
 
 # =============================================================================================
-# 2. Database
+# 3. Database
 # =============================================================================================
-function Invoke-SqlFile([string] $Path, [bool] $NoDb) {
-    $a = @('-u', $MysqlUser, '--default-character-set=utf8mb4')
-    if (-not $NoDb) { $a += $DbName }
-    $a += @('-e', "SOURCE $($Path.Replace('\', '/'))")
-    $env:MYSQL_PWD = $MysqlPassword
-    try { & $MysqlExe @a }
-    finally { Remove-Item Env:\MYSQL_PWD -ErrorAction SilentlyContinue }
-    if ($LASTEXITCODE -ne 0) { throw "mysql failed (exit $LASTEXITCODE) on $Path" }
-}
-
 if (-not $SkipDatabase) {
-    Write-Step "Building database $DbName"
+    Write-Step "Building database $($map.DB_PATH_WIN)"
+    $isNew = -not (Test-Path -LiteralPath $DbPath)
+    if (-not $isNew) {
+        # A consistent copy first: VACUUM INTO works while other sessions have the database open.
+        $copy = Join-Path $backupRoot ('claude_memory-before-install.db')
+        New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+        Invoke-MemdbCapture -Memdb $memdb -Arguments @('--db', $DbPath, '-e', ("VACUUM INTO '" + $copy.Replace('\', '/') + "';")) | Out-Null
+        Write-Item 'backed up' $copy
+    }
     $tmp = Join-Path $env:TEMP "claude-memory-install-$stamp"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     try {
         $i = 0
         foreach ($step in $manifest.Database) {
-            if ($SkipServerSettings -and $step.File -eq 'db:server-settings.sql') { Write-Item 'skipped' $step.File; continue }
-            $kind, $rel = $step.File -split ':', 2
+            $kind, $rel = $step -split ':', 2
             $src = Join-Path $repo ("{0}\{1}" -f ($(if ($kind -eq 'db') { 'db' } else { 'home' })), $rel)
             $i++
             $rendered = Join-Path $tmp ('{0:D2}_{1}' -f $i, [System.IO.Path]::GetFileName($rel))
             Write-Utf8 $rendered (Expand-Template $src)
-            Invoke-SqlFile $rendered ([bool]$step.NoDb)
-            Write-Item 'applied' $step.File
+            $memdbArgs = @('--db', $DbPath, '-f', $rendered)
+            if ($i -eq 1) { $memdbArgs = @('--create') + $memdbArgs }
+            Invoke-MemdbCapture -Memdb $memdb -Arguments $memdbArgs | Out-Null
+            Write-Item 'applied' $step
         }
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $sql = "SELECT " +
-        "(SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$DbName' AND table_type = 'BASE TABLE'), " +
-        "(SELECT COUNT(*) FROM information_schema.views WHERE table_schema = '$DbName'), " +
-        "(SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = '$DbName' AND routine_type = 'PROCEDURE'), " +
-        "(SELECT COUNT(*) FROM information_schema.events WHERE event_schema = '$DbName'), " +
-        "@@global.event_scheduler;"
-    $row = (Invoke-MysqlCapture -MysqlExe $MysqlExe -MysqlUser $MysqlUser -MysqlPassword $MysqlPassword -Sql $sql).Trim() -split "`t"
+        "(SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite%' AND name NOT LIKE '%fts%'), " +
+        "(SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND sql LIKE 'CREATE VIRTUAL TABLE%fts5%'), " +
+        "(SELECT COUNT(*) FROM sqlite_schema WHERE type = 'view'), " +
+        "(SELECT COUNT(*) FROM reference_queries), (SELECT COUNT(*) FROM consolidation_config);"
+    $row = (Invoke-MemdbCapture -Memdb $memdb -Arguments @('--db', $DbPath, '-N', '-e', $sql)).Trim() -split "`t"
+    $procs = @((Invoke-MemdbCapture -Memdb $memdb -Arguments @('--procs')).Trim() -split "`r?`n" | Where-Object { $_ })
     $exp = $manifest.Expect
     Write-Item 'tables' ("{0} (expected {1})" -f $row[0], $exp.Tables)
-    Write-Item 'views' ("{0} (expected {1})" -f $row[1], $exp.Views)
-    Write-Item 'procs' ("{0} (expected {1})" -f $row[2], $exp.Procedures)
-    Write-Item 'events' ("{0} (expected {1}); event_scheduler={2}" -f $row[3], $exp.Events, $row[4])
-    if ([int]$row[0] -lt $exp.Tables -or [int]$row[1] -lt $exp.Views -or [int]$row[2] -lt $exp.Procedures -or [int]$row[3] -lt $exp.Events) {
-        throw 'The database is missing objects; see the mysql output above.'
+    Write-Item 'fts' ("{0} full-text indexes (expected {1})" -f $row[1], $exp.FtsIndexes)
+    Write-Item 'views' ("{0} (expected {1})" -f $row[2], $exp.Views)
+    Write-Item 'procs' ("{0} in memdb (expected {1})" -f $procs.Count, $exp.Procedures)
+    Write-Item 'seed' ("{0} reference queries, {1} config rows" -f $row[3], $row[4])
+    if ([int]$row[0] -lt $exp.Tables -or [int]$row[1] -lt $exp.FtsIndexes -or [int]$row[2] -lt $exp.Views -or $procs.Count -lt $exp.Procedures) {
+        throw 'The database or memdb is missing objects; see above.'
     }
-    if ($row[4] -ne 'ON') { Write-Warning 'event_scheduler is OFF: the hourly mechanical consolidation will not run until it is turned on.' }
 }
 
 # =============================================================================================
-# 3. settings.json hooks
+# 4. settings.json hooks
 # =============================================================================================
 function Set-Prop($Object, [string] $Name, $Value) {
     if ($Object.PSObject.Properties[$Name]) { $Object.$Name = $Value }
@@ -316,11 +335,11 @@ if (-not $SkipSettings) {
     $archiveCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$($map.CLAUDE_HOME_WIN)\archive_transcripts.ps1`""
     $bootCmd    = "bash `"$($map.CLAUDE_HOME_FWD)/session_boot.sh`""
     $closeCmd   = "bash `"$($map.CLAUDE_HOME_FWD)/session_close.sh`""
-    Add-Hook 'SessionStart' ''        $archiveCmd 120 'Archiving session transcripts...'          'archive_transcripts.ps1'
-    Add-Hook 'SessionStart' 'startup' $bootCmd    60  "Booting session from $DbName..."          'session_boot.sh'
-    Add-Hook 'SessionEnd'   ''        $archiveCmd 120 'Archiving session transcripts...'          'archive_transcripts.ps1'
+    Add-Hook 'SessionStart' ''        $archiveCmd 120 'Archiving session transcripts...'   'archive_transcripts.ps1'
+    Add-Hook 'SessionStart' 'startup' $bootCmd    60  'Booting session from claude_memory...' 'session_boot.sh'
+    Add-Hook 'SessionEnd'   ''        $archiveCmd 120 'Archiving session transcripts...'   'archive_transcripts.ps1'
     if ($WireSessionClose) {
-        Add-Hook 'SessionEnd' ''      $closeCmd   30  "Closing $DbName session..."               'session_close.sh'
+        Add-Hook 'SessionEnd' ''      $closeCmd   30  'Closing claude_memory session...'   'session_close.sh'
     }
     # Rule 1: the database is the only memory. Claude Code's own file-based auto memory would compete.
     Set-Prop $settings 'autoMemoryEnabled' $false
@@ -332,7 +351,7 @@ if (-not $SkipSettings) {
 }
 
 # =============================================================================================
-# 4. Scheduled consolidation (optional)
+# 5. Scheduled consolidation (optional)
 # =============================================================================================
 if ($RegisterConsolidationTask) {
     Write-Step "Registering scheduled task $TaskName"
@@ -346,7 +365,7 @@ if ($RegisterConsolidationTask) {
     # Interactive: runs only while you are logged on, with your profile and your Claude login.
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $taskSettings -Principal $principal `
-        -Description "Claude memory consolidation (judgment tier) via the consolidate-memory-db skill, every 3 hours. Gated by consolidation_config in $DbName." `
+        -Description 'Claude memory consolidation (judgment tier) via the consolidate-memory-db skill, every 3 hours. Gated by consolidation_config in the claude_memory database.' `
         -Force | Out-Null
     Write-Item 'registered' "$TaskName -> $runner"
 }

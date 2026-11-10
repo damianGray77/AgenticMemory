@@ -1,7 +1,13 @@
-# Never commit rendered files, dumps or credentials.
+# Never commit rendered files, databases, dumps or credentials.
+*.db
+*.db-wal
+*.db-shm
 *.my.cnf
-.my.cnf
 *.dump.sql
 *_data.sql
 logs/
 runs/
+memdb/bin/
+
+# Work-specific terms for the export leak scan (tools/export-from-live.ps1). Kept local on purpose.
+tools/leak-terms.local.txt

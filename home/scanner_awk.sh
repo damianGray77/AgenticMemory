@@ -1,12 +1,15 @@
 #!/bin/bash
-# scanner_awk.sh v3 - Fast AWK-based entity extraction for {{DB_NAME}}
-# Called by claude_scanner.sh. Generates SQL from grep output.
+# scanner_awk.sh v3 - Fast AWK-based entity extraction for the claude_memory database
+# Called by claude_scanner.sh. Generates SQLite SQL (run through memdb) from grep output.
 # Usage: grep ... | bash scanner_awk.sh <mode> <project_id> <unix_path>
 #
 # Entity modes: cs_types, cs_methods, php_classes, php_functions, wp_hooks,
 #               js_functions, js_classes, py_entities,
 #               cpp_types, cpp_methods, cpp_functions
+#   -> one INSERT INTO code_entities per match; file_id is looked up from source_files by
+#      (project_id, relative_path), so the file must have been registered earlier in the script.
 # Dependency modes: cs_usings, php_includes, js_imports, py_imports, cpp_includes
+#   -> INSERT INTO _fdeps (a TEMP table claude_scanner.sh creates and resolves)
 #
 # Marker generation is NOT done here — it's handled by AI enrichment post-scan.
 
@@ -19,10 +22,16 @@ BEGIN {
   FS = ":"
 }
 
+# Body of an SQLite string literal: double each single quote (\047). Backslashes are ordinary
+# characters in SQLite and pass through unchanged.
 function escape(s) {
-  gsub(/\\/, "\\\\", s)
-  gsub(/\047/, "\\\047", s)
+  gsub(/\047/, "\047\047", s)
   return s
+}
+
+# file_id of the current file (esc_path is set per input line below)
+function file_id_sql() {
+  return sprintf("(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047)", pid, esc_path)
 }
 
 function make_sig(line,    sig) {
@@ -88,8 +97,7 @@ function make_sig(line,    sig) {
 
     if (name != "" && kind != "") {
       esc_name = escape(name)
-      printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-      printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047%s\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", kind, esc_name, sig, linenum, vis, is_static
+      printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047%s\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), kind, esc_name, sig, linenum, vis, is_static
     }
   }
 
@@ -112,8 +120,7 @@ function make_sig(line,    sig) {
     if (name == "" || name ~ /^(get|set|add|remove|value|nameof|typeof|sizeof|default|base|this)$/) next
 
     esc_name = escape(name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047method\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", esc_name, sig, linenum, vis, is_static
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047method\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), esc_name, sig, linenum, vis, is_static
   }
 
   # ============================================================
@@ -134,8 +141,7 @@ function make_sig(line,    sig) {
     is_static = (content ~ /[[:space:]]static[[:space:]]/) ? 1 : 0
 
     esc_name = escape(name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047function\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", esc_name, sig, linenum, vis, is_static
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047function\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), esc_name, sig, linenum, vis, is_static
   }
 
   # ============================================================
@@ -155,8 +161,7 @@ function make_sig(line,    sig) {
     }
     if (hook_name == "") next
     esc_name = escape(hook_name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,last_scanned_at) VALUES (@fid,\047%s\047,\047%s\047,\047%s\047,%d,NOW());\n", kind, esc_name, sig, linenum
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,last_scanned_at) VALUES (%s,\047%s\047,\047%s\047,\047%s\047,%d,now());\n", file_id_sql(), kind, esc_name, sig, linenum
   }
 
   # ============================================================
@@ -179,8 +184,7 @@ function make_sig(line,    sig) {
     is_static = 0
 
     esc_name = escape(name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047function\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", esc_name, sig, linenum, vis, is_static
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047function\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), esc_name, sig, linenum, vis, is_static
   }
 
   # ============================================================
@@ -265,8 +269,7 @@ function make_sig(line,    sig) {
     vis = "public"
     is_static = 0
     esc_name = escape(name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047%s\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", kind, esc_name, sig, linenum, vis, is_static
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047%s\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), kind, esc_name, sig, linenum, vis, is_static
   }
 
   # ============================================================
@@ -290,8 +293,7 @@ function make_sig(line,    sig) {
     is_static = (content ~ /[[:space:]]static[[:space:]]/) ? 1 : 0
     esc_name = escape(name)
     esc_qname = escape(classname "." name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,qualified_name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047method\047,\047%s\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", esc_name, esc_qname, sig, linenum, vis, is_static
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,qualified_name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047method\047,\047%s\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), esc_name, esc_qname, sig, linenum, vis, is_static
   }
 
   # ============================================================
@@ -308,8 +310,7 @@ function make_sig(line,    sig) {
     vis = "public"
     is_static = (content ~ /^static[[:space:]]/) ? 1 : 0
     esc_name = escape(name)
-    printf "SET @fid=(SELECT id FROM source_files WHERE project_id=%d AND relative_path=\047%s\047);\n", pid, esc_path
-    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (@fid,\047function\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,NOW());\n", esc_name, sig, linenum, vis, is_static
+    printf "INSERT INTO code_entities (file_id,entity_kind,name,signature,line_start,visibility,is_static,last_scanned_at) VALUES (%s,\047function\047,\047%s\047,\047%s\047,%d,\047%s\047,%d,now());\n", file_id_sql(), esc_name, sig, linenum, vis, is_static
   }
 
   # ============================================================

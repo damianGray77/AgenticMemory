@@ -3,6 +3,7 @@
 #
 # Every file listed under Home and Runner is a TEMPLATE in this repo: machine-specific
 # values are replaced by {{TOKENS}} on export and filled back in on install.
+# memdb.exe is not listed: install.ps1 compiles it from memdb\src into <ClaudeHome>\bin.
 @{
     # Relative to the Claude config folder (~\.claude). Stored in the repo under home\.
     Home = @(
@@ -31,21 +32,19 @@
         'runner-settings.json'
     )
 
-    # Database build order. 'db:' paths are under db\ in the repo, 'home:' paths under home\.
-    # NoDb = run without selecting the database (the file selects or creates it itself).
+    # Database build order, all run through memdb. 'db:' paths are under db\ in the repo,
+    # 'home:' paths under home\. Every file is safe to re-run.
     Database = @(
-        @{ File = 'db:server-settings.sql';                 NoDb = $true  }
-        @{ File = 'home:claude_memory_schema.sql';           NoDb = $true  }
-        @{ File = 'db:seed.sql';                             NoDb = $false }
-        @{ File = 'home:consolidator\tier1_mechanical.sql';  NoDb = $false }
-        @{ File = 'home:consolidator\judgment_procs.sql';    NoDb = $false }
-        @{ File = 'home:consolidator\behaviours.sql';        NoDb = $false }
-        @{ File = 'home:consolidator\digest.sql';            NoDb = $false }
-        @{ File = 'home:consolidator\confirm.sql';           NoDb = $false }
-        @{ File = 'db:event.sql';                            NoDb = $false }
+        'home:claude_memory_schema.sql'
+        'db:seed.sql'
+        'home:consolidator\tier1_mechanical.sql'
+        'home:consolidator\judgment_procs.sql'
+        'home:consolidator\behaviours.sql'
+        'home:consolidator\digest.sql'
+        'home:consolidator\confirm.sql'
     )
 
-    # Seed tables exported from the live database by tools\export-from-live.ps1 into db\seed.sql.
+    # Seed tables exported from a live database by tools\export-from-live.ps1 into db\seed.sql.
     # Upsert = refresh on re-install; Ignore = keep whatever the target already has.
     Seed = @(
         @{ Table = 'reference_queries';        Key = 'name';    Columns = @('name', 'description', 'sql_template', 'category'); Mode = 'Upsert' }
@@ -54,5 +53,5 @@
     )
 
     # What a complete install contains, checked at the end of install.ps1.
-    Expect = @{ Tables = 25; Views = 14; Procedures = 21; Events = 1 }
+    Expect = @{ Tables = 25; FtsIndexes = 7; Views = 14; Procedures = 21 }
 }

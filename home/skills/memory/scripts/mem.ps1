@@ -1,27 +1,26 @@
 <#
 .SYNOPSIS
-    Write to the {{DB_NAME}} database - notes, memories, observations, session close, back-pointers.
+    Write to the claude_memory database - notes, memories, observations, session close, back-pointers.
 
 .DESCRIPTION
     This exists for three reasons, in order of how much they actually hurt.
 
     1. QUOTING. Memory content is prose: apostrophes, em dashes, newlines, embedded SQL, Windows
-       paths full of backslashes. Threading that through `mysql -e "..."` inside a shell is fragile
-       enough that sessions routinely gave up and wrote throwaway .sql files to a scratch directory
-       first. Content arrives here through -ContentFile (or stdin) and never touches a command line
-       or a shell parser, so there is nothing to escape by hand.
+       paths full of backslashes. Threading that through a database CLI's -e "..." inside a shell is
+       fragile enough that sessions routinely gave up and wrote throwaway .sql files to a scratch
+       directory first. Content arrives here through -ContentFile (or stdin) and never touches a
+       command line or a shell parser, so there is nothing to escape by hand.
 
     2. PERMISSION CHURN. Claude Code appends the LITERAL command string to permissions.allow when
        you approve one. Because every INSERT carried unique prose, every write minted a new
-       single-use rule that could never match again - 379 of them, 539 KB, including whole memory
+       single-use rule that could never match again - hundreds of them, including whole memory
        bodies frozen into a settings file. One stable script means one prefix rule, forever.
 
     3. DRIFT. Required columns, the memory_type enum, the observations upsert that bumps
        observed_count and nudges confidence, the memory_sources shape - every session re-derived
        these from CLAUDE.md and some got them subtly wrong. They live here once.
 
-    The password stays out of argv: a --defaults-file is used when present, so the credential is
-    not visible in the command line, the process list, the approved-command list, or the transcript.
+    The database is SQLite, driven by memdb.exe; memdb finds the database file itself.
 
 .PARAMETER Action
     note | memory | observe | close | source. See the EXAMPLES.
@@ -34,7 +33,7 @@
     .\mem.ps1 -Action note -SessionId 1382 -Type decision -Title "Chose X over Y" -ContentFile note.txt
     .\mem.ps1 -Action memory -Type project -Category completed_work -ProjectId 8 -Title "..." -ContentFile m.txt
     .\mem.ps1 -Action observe -Category workstyle -Title "Prefers terse diffs" -ContentFile o.txt
-    .\mem.ps1 -Action close -SessionId 1382 -Summary "..." -Topics '["archive","fable"]'
+    .\mem.ps1 -Action close -SessionId 1382 -Summary "..." -Topics '["archive","search"]'
     .\mem.ps1 -Action source -MemoryId 1465 -TranscriptId 3150 -StartUuid abc -EndUuid def
 #>
 [CmdletBinding()]
@@ -51,7 +50,7 @@ param(
     # --- note ---------------------------------------------------------------------------------
     [int] $SessionId,
 
-    # note_type (free-form by schema; these are the CLAUDE.md set) or memory_type (a real ENUM).
+    # note_type (free-form by schema; these are the CLAUDE.md set) or memory_type (a real enum).
     [string] $Type,
 
     # --- memory / observe ---------------------------------------------------------------------
@@ -79,24 +78,21 @@ param(
     [string] $Rationale,
 
     # --- plumbing ---------------------------------------------------------------------------------
-    [string] $MysqlExe = '{{MYSQL_EXE_WIN}}',
-    [string] $DefaultsFile = "$env:USERPROFILE\.claude\.my.cnf",
-    [string] $Database = '{{DB_NAME}}',
+    [string] $Memdb = '{{MEMDB_WIN}}',
+    [string] $DbPath,              # default: wherever memdb resolves it
     [switch] $DryRun
 )
 
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------------------------
-# SQL string literal escaping. Order matters: the backslash must be doubled FIRST, or the
-# backslashes introduced when escaping quotes get doubled a second time and corrupt the value.
-# Windows paths ("C:\Projects\...") make this a routine case, not a corner one.
+# SQL string literal. SQLite has exactly one escape: a single quote is doubled. Backslashes are
+# ordinary characters, so Windows paths ("C:\Projects\...") go in untouched.
 # ---------------------------------------------------------------------------------------------
 function ConvertTo-SqlLiteral {
     param([AllowNull()] [string] $Value)
     if ($null -eq $Value) { return 'NULL' }
-    $e = $Value.Replace('\', '\\').Replace("'", "''")
-    return "'" + $e + "'"
+    return "'" + $Value.Replace("'", "''") + "'"
 }
 
 function ConvertTo-SqlNumber {
@@ -124,12 +120,12 @@ function Resolve-Body {
     return $null
 }
 
-# title is VARCHAR(255) on memories/session_notes/user_observations. Fail loudly rather than let
-# the server truncate a title silently - a clipped title is how a memory becomes unfindable later.
+# Titles are capped at 255 characters (a CHECK constraint). Fail loudly with a readable message
+# rather than a constraint error - a clipped title is how a memory becomes unfindable later.
 function Assert-Title {
     param([string] $Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { throw "-Title is required for action '$Action'." }
-    if ($Value.Length -gt 255) { throw "-Title is $($Value.Length) chars; the column is VARCHAR(255). Shorten it." }
+    if ($Value.Length -gt 255) { throw "-Title is $($Value.Length) chars; the limit is 255. Shorten it." }
 }
 
 function Assert-Body {
@@ -150,14 +146,13 @@ switch ($Action) {
         Assert-Body $body
         $sql = @"
 INSERT INTO session_notes (session_id, note_type, title, content)
-VALUES ($SessionId, $(ConvertTo-SqlLiteral $Type), $(ConvertTo-SqlLiteral $Title), $(ConvertTo-SqlLiteral $body));
-SELECT LAST_INSERT_ID();
+VALUES ($SessionId, $(ConvertTo-SqlLiteral $Type), $(ConvertTo-SqlLiteral $Title), $(ConvertTo-SqlLiteral $body))
+RETURNING id;
 "@
     }
 
     'memory' {
-        # memory_type is a real ENUM - reject a bad value here with a readable message rather than
-        # letting MySQL emit "Data truncated for column 'memory_type'", which says nothing useful.
+        # memory_type is a CHECK-constrained enum - reject a bad value here with a readable message.
         $valid = @('user', 'feedback', 'project', 'reference')
         if ($valid -notcontains $Type) {
             throw "-Type must be one of: $($valid -join ', ')  (got '$Type')"
@@ -185,15 +180,16 @@ SELECT LAST_INSERT_ID();
         if ($ExpiresAt)      { $cols += 'expires_at';     $vals += (ConvertTo-SqlLiteral $ExpiresAt) }
         $sql = @"
 INSERT INTO memories ($($cols -join ', '))
-VALUES ($($vals -join ', '));
-SELECT LAST_INSERT_ID();
+VALUES ($($vals -join ', '))
+RETURNING id;
 "@
     }
 
     'observe' {
-        # user_observations has UNIQUE(title), which is what makes this an upsert rather than a
-        # duplicate: re-observing the same pattern bumps the count and nudges confidence toward 1.0
-        # instead of littering near-identical rows. The clamp lives here so every caller shares it.
+        # user_observations has a UNIQUE (case-insensitive) title, which is what makes this an upsert
+        # rather than a duplicate: re-observing the same pattern bumps the count and nudges confidence
+        # toward 1.0 instead of littering near-identical rows. Rounded to 2 places, as the column was
+        # DECIMAL(3,2) under MySQL and the boot filters on confidence >= 0.50.
         if ([string]::IsNullOrWhiteSpace($Category)) { throw "-Category is required for an observation." }
         Assert-Title $Title
         Assert-Body $body
@@ -201,24 +197,24 @@ SELECT LAST_INSERT_ID();
         $sql = @"
 INSERT INTO user_observations (category, title, content)
 VALUES ($(ConvertTo-SqlLiteral $Category), $(ConvertTo-SqlLiteral $Title), $(ConvertTo-SqlLiteral $body))
-ON DUPLICATE KEY UPDATE
+ON CONFLICT (title) DO UPDATE SET
   observed_count = observed_count + 1,
-  last_seen      = NOW(),
-  confidence     = LEAST(confidence + $step, 1.00);
-SELECT LAST_INSERT_ID();
+  last_seen      = now(),
+  confidence     = min(round(confidence + $step, 2), 1.00)
+RETURNING id;
 "@
     }
 
     'close' {
         if ($SessionId -le 0) { throw "-SessionId is required to close a session." }
-        $sets = @("status = $(ConvertTo-SqlLiteral $Status)", 'ended_at = NOW()')
+        $sets = @("status = $(ConvertTo-SqlLiteral $Status)", 'ended_at = now()')
         if ($PSBoundParameters.ContainsKey('Summary')) { $sets += "summary = $(ConvertTo-SqlLiteral $Summary)" }
         elseif ($body)                                 { $sets += "summary = $(ConvertTo-SqlLiteral $body)" }
         if ($Files)  { $sets += "files_touched = $(ConvertTo-SqlLiteral $Files)" }
         if ($Topics) { $sets += "topics = $(ConvertTo-SqlLiteral $Topics)" }
         $sql = @"
 UPDATE sessions SET $($sets -join ', ') WHERE id = $SessionId;
-SELECT ROW_COUNT();
+SELECT changes();
 "@
     }
 
@@ -236,63 +232,41 @@ SELECT ROW_COUNT();
         $sql = @"
 INSERT INTO memory_sources (source_type, memory_id, note_id, transcript_id, start_message_uuid, end_message_uuid, rationale)
 VALUES ($(ConvertTo-SqlLiteral $srcType), $(ConvertTo-SqlNumber $MemoryId), $(ConvertTo-SqlNumber $NoteId),
-        $TranscriptId, $(ConvertTo-SqlLiteral $StartUuid), $endLit, $(ConvertTo-SqlLiteral $Rationale));
-SELECT LAST_INSERT_ID();
+        $TranscriptId, $(ConvertTo-SqlLiteral $StartUuid), $endLit, $(ConvertTo-SqlLiteral $Rationale))
+RETURNING id;
 "@
     }
 }
 
-$script = "USE ``$Database``;`n$sql"
-
 if ($DryRun) {
-    Write-Output $script
+    Write-Output $sql
     return
 }
 
-if (-not (Test-Path -LiteralPath $MysqlExe)) { throw "mysql.exe not found at: $MysqlExe" }
+if (-not (Test-Path -LiteralPath $Memdb)) { throw "memdb.exe not found at: $Memdb" }
 
-# Credentials: a --defaults-file keeps them out of argv entirely. Without one we fall back to the
-# documented local-dev login, so the script works on a machine that has not been hardened yet.
-$connArgs = @()
-if (Test-Path -LiteralPath $DefaultsFile) {
-    $connArgs += "--defaults-file=$DefaultsFile"
-} else {
-    $pw = $env:CLAUDE_MEMORY_PASSWORD
-    if (-not $pw) { $pw = '{{MYSQL_PASSWORD}}' }
-    $connArgs += @('-u', '{{MYSQL_USER}}', "-p$pw")
-}
-# -N -B: no column headers, tab-separated - the caller wants the inserted id, not a rendered table.
-$connArgs += @('-N', '-B')
-
-# NOT optional. The script is written as UTF-8, but the client otherwise decodes stdin using its own
-# default (the console codepage here), and every character it cannot map silently becomes a literal
-# '?'. Verified: without this an em dash round-tripped to HEX 3F3F3F - three question marks, stored
-# and unrecoverable. Prose memories are full of em dashes, curly quotes and accented names, so a
-# silent lossy write is the worst possible failure for an archive nobody re-reads immediately.
-$connArgs += '--default-character-set=utf8mb4'
+$memdbArgs = @('-N')
+if ($DbPath) { $memdbArgs = @('--db', $DbPath) + $memdbArgs }
 
 # Piped over stdin rather than passed with -e: no command-line length ceiling, and the prose never
-# meets a shell parser.
+# meets a shell parser. memdb reads stdin as UTF-8.
 #
-# THE UNICODE PATH, which took three attempts to get right - each stage silently degrades prose:
+# THE UNICODE PATH - each stage silently degrades prose if left alone:
 #   1. $OutputEncoding governs how a string piped into a NATIVE process is encoded, and in Windows
-#      PowerShell 5.1 it defaults to ASCIIEncoding. Left alone, every non-ASCII character reaches
-#      mysql as '?'. Measured: an em dash stored as HEX 3F3F3F.
-#   2. --default-character-set=utf8mb4 alone fixes nothing, because that loss happens upstream of
-#      the client. Both are required.
-#   3. Do NOT stage this through a temp file read back with Get-Content: without a BOM, 5.1 decodes
-#      the file as the ANSI codepage, so UTF-8 bytes come back as mojibake and then get re-encoded
-#      as UTF-8 (an em dash became C3A2E282AC...). $script is already in memory - pipe it directly
-#      and there is no decode step to get wrong.
+#      PowerShell 5.1 it defaults to ASCIIEncoding: every non-ASCII character would reach memdb as
+#      '?' (an em dash stored as three question marks, unrecoverably).
+#   2. Do NOT stage this through a temp file read back with Get-Content: without a BOM, 5.1 decodes
+#      the file as the ANSI codepage, so UTF-8 bytes come back as mojibake and then get re-encoded.
+#      $sql is already in memory - pipe it directly and there is no decode step to get wrong.
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 # No 2>&1 here: in Windows PowerShell 5.1, redirecting a NATIVE command's stderr wraps each line in
 # a NativeCommandError and flips $? to false even on a clean exit 0. stderr passes through to the
 # caller on its own; the exit code is the honest success signal.
-$out = $script | & $MysqlExe @connArgs
+$out = $sql | & $Memdb @memdbArgs
 $code = $LASTEXITCODE
 $text = ($out | Out-String).Trim()
 if ($code -ne 0) {
-    throw "mysql exited $code : $text"
+    throw "memdb exited $code : $text"
 }
 Write-Output $text

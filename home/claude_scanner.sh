@@ -1,37 +1,44 @@
 #!/bin/bash
-# claude_scanner.sh v3 - Fast project scanner for {{DB_NAME}} database
+# claude_scanner.sh v3 - Fast project scanner for the claude_memory database
 # Uses project-wide grep passes instead of per-file extraction.
-# Designed for Windows (Git Bash) + MySQL 8.0.
+# Designed for Windows (Git Bash) + the SQLite memory database, driven through memdb.exe.
 #
-# Usage:
+# Usage (run without arguments for the full list):
 #   ./claude_scanner.sh scan <project-slug>
 #   ./claude_scanner.sh scan-all
 #   ./claude_scanner.sh onboard <slug> <name> <path> [language] [framework] [desc]
+#   ./claude_scanner.sh update <project-slug> [--file <relative-path>]
+#   ./claude_scanner.sh deps <project-slug>
 #   ./claude_scanner.sh status [project-slug]
 #   ./claude_scanner.sh reset <project-slug>
 
 set -uo pipefail
 
-MYSQL_BIN="{{MYSQL_EXE_POSIX}}"
-MYSQL_USER="{{MYSQL_USER}}"
-MYSQL_PASS="{{MYSQL_PASSWORD}}"
-MYSQL_DB="{{DB_NAME}}"
+# memdb finds the database itself (--db, else $CLAUDE_MEMORY_DB, else ..\claude_memory.db
+# next to its bin folder), so no path or credentials are passed here.
+MEMDB="{{MEMDB_POSIX}}"
 SQL_FILE=""
 
-mysql_exec() {
-  "$MYSQL_BIN" -u "$MYSQL_USER" -p"$MYSQL_PASS" "$MYSQL_DB" -N -B -e "$1" 2>/dev/null | tr -d '\r'
+# One query; tab-separated rows without a header. memdb escapes tab, newline and backslash
+# inside values as \t \n \\ (so a stored C:\path comes back as C:\\path; win_to_unix copes).
+memdb_exec() {
+  "$MEMDB" -N -B -e "$1" 2>/dev/null | tr -d '\r'
 }
 
-mysql_batch() {
-  "$MYSQL_BIN" -u "$MYSQL_USER" -p"$MYSQL_PASS" "$MYSQL_DB" < "$1" 2>&1
+# A generated SQL script, fed on stdin. memdb stops at the first failing statement and exits 1;
+# the scripts below run inside BEGIN ... COMMIT, so a failure leaves the database unchanged.
+memdb_batch() {
+  "$MEMDB" < "$1" 2>&1
 }
 
 win_to_unix() {
   echo "$1" | tr '\\' '/' | awk '{sub(/^[A-Za-z]:/, "/" tolower(substr($0,1,1))); print}'
 }
 
+# Body of an SQLite string literal: double each single quote. A backslash is an ordinary
+# character in SQLite, so Windows paths and regexes are stored exactly as written.
 escape_sql() {
-  printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"
+  printf '%s' "$1" | sed "s/'/''/g"
 }
 
 emit() {
@@ -90,7 +97,7 @@ get_find_excludes() {
 scan_project() {
   local slug="$1"
   local project_info
-  project_info=$(mysql_exec "SELECT id, root_path, IFNULL(primary_language,''), IFNULL(framework,'') FROM projects WHERE slug='$slug' AND is_active=1")
+  project_info=$(memdb_exec "SELECT id, root_path, IFNULL(primary_language,''), IFNULL(framework,'') FROM projects WHERE slug='$slug' AND is_active=1")
 
   if [[ -z "$project_info" ]]; then
     echo "ERROR: Project '$slug' not found."
@@ -118,19 +125,21 @@ scan_project() {
   exclude_pat=$(get_find_excludes "$lang" "$framework")
 
   # --- SQL Header ---
+  # The purge runs with foreign-key enforcement off, so deleting code_entities removes only the
+  # rows deleted explicitly here (no ON DELETE cascades). PRAGMA foreign_keys cannot change inside
+  # a transaction, so it is set before BEGIN and stays off for this one memdb connection; nothing
+  # after the purge deletes rows, and every id the script inserts comes from an existing row.
   cat > "$SQL_FILE" << SQLHEADER
-USE {{DB_NAME}};
-SET @pid = $project_id;
-SET FOREIGN_KEY_CHECKS = 0;
-DELETE em FROM entity_markers em JOIN code_entities ce ON ce.id=em.entity_id JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=@pid;
-DELETE fm FROM file_markers fm JOIN source_files sf ON sf.id=fm.file_id WHERE sf.project_id=@pid;
-DELETE ed FROM entity_dependencies ed JOIN code_entities ce ON ce.id=ed.caller_id JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=@pid;
-DELETE FROM code_entities WHERE file_id IN (SELECT id FROM source_files WHERE project_id=@pid);
-DELETE FROM file_dependencies WHERE source_file_id IN (SELECT id FROM source_files WHERE project_id=@pid);
-UPDATE source_files SET is_deleted=1 WHERE project_id=@pid;
-SET FOREIGN_KEY_CHECKS = 1;
-DROP TEMPORARY TABLE IF EXISTS _fdeps;
-CREATE TEMPORARY TABLE _fdeps (source_path VARCHAR(500),target_ref VARCHAR(500),dep_type VARCHAR(50));
+PRAGMA foreign_keys = OFF;
+BEGIN;
+DELETE FROM entity_markers WHERE entity_id IN (SELECT ce.id FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$project_id);
+DELETE FROM file_markers WHERE file_id IN (SELECT id FROM source_files WHERE project_id=$project_id);
+DELETE FROM entity_dependencies WHERE caller_id IN (SELECT ce.id FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$project_id);
+DELETE FROM code_entities WHERE file_id IN (SELECT id FROM source_files WHERE project_id=$project_id);
+DELETE FROM file_dependencies WHERE source_file_id IN (SELECT id FROM source_files WHERE project_id=$project_id);
+UPDATE source_files SET is_deleted=1 WHERE project_id=$project_id;
+DROP TABLE IF EXISTS temp._fdeps;
+CREATE TEMP TABLE _fdeps (source_path TEXT COLLATE NOCASE, target_ref TEXT COLLATE NOCASE, dep_type TEXT COLLATE NOCASE);
 SQLHEADER
 
   # --- Phase 1: Register all source files ---
@@ -149,7 +158,7 @@ SQLHEADER
     line_count=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
     hash=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
     esc_path=$(escape_sql "$rel_path")
-    emit "INSERT INTO source_files (project_id,relative_path,file_type,line_count,file_hash,last_scanned_at,is_deleted) VALUES (@pid,'$esc_path','$ext',$line_count,'$hash',NOW(),0) ON DUPLICATE KEY UPDATE line_count=$line_count,file_hash='$hash',last_scanned_at=NOW(),is_deleted=0;"
+    emit "INSERT INTO source_files (project_id,relative_path,file_type,line_count,file_hash,last_scanned_at,is_deleted) VALUES ($project_id,'$esc_path','$ext',$line_count,'$hash',now(),0) ON CONFLICT (project_id,relative_path) DO UPDATE SET line_count=$line_count,file_hash='$hash',last_scanned_at=now(),is_deleted=0;"
   done
 
   file_count=$(grep -c "INSERT INTO source_files" "$SQL_FILE")
@@ -287,20 +296,25 @@ SQLHEADER
 
   # --- Phase 3: Post-processing ---
   echo "    Phase 3: Post-processing and loading..."
-  cat >> "$SQL_FILE" << 'SQLFOOTER'
--- Resolve file dependencies: match target_ref to actual source_files
-INSERT IGNORE INTO file_dependencies (source_file_id, target_file_id, dependency_type)
+  # Unquoted heredoc: $project_id is substituted; the SQL below has no other $ or backquote.
+  cat >> "$SQL_FILE" << SQLFOOTER
+-- Resolve file dependencies: match target_ref to actual source_files.
+-- LIKE is case-insensitive for ASCII. ESCAPE keeps the scanner's original LIKE rule that a
+-- backslash in the pattern (a PHP namespace such as App\Models\User) escapes the next character.
+INSERT OR IGNORE INTO file_dependencies (source_file_id, target_file_id, dependency_type)
   SELECT sf_src.id, sf_tgt.id, fd.dep_type
   FROM _fdeps fd
-  JOIN source_files sf_src ON sf_src.project_id=@pid AND sf_src.relative_path=fd.source_path AND sf_src.is_deleted=0
-  JOIN source_files sf_tgt ON sf_tgt.project_id=@pid AND sf_tgt.is_deleted=0
-    AND (sf_tgt.relative_path LIKE CONCAT('%', REPLACE(fd.target_ref, '.', '/'), '%')
-      OR sf_tgt.relative_path LIKE CONCAT('%', fd.target_ref, '%'))
+  JOIN source_files sf_src ON sf_src.project_id=$project_id AND sf_src.relative_path=fd.source_path AND sf_src.is_deleted=0
+  JOIN source_files sf_tgt ON sf_tgt.project_id=$project_id AND sf_tgt.is_deleted=0
+    AND (sf_tgt.relative_path LIKE '%' || replace(fd.target_ref, '.', '/') || '%' ESCAPE '\\'
+      OR sf_tgt.relative_path LIKE '%' || fd.target_ref || '%' ESCAPE '\\')
   WHERE sf_src.id != sf_tgt.id;
-DROP TEMPORARY TABLE IF EXISTS _fdeps;
+DROP TABLE IF EXISTS temp._fdeps;
 -- Link methods/functions to their parent class (nearest preceding class in same file)
-UPDATE code_entities child
-JOIN (
+UPDATE code_entities AS child
+SET parent_entity_id = linkage.parent_id,
+    qualified_name = linkage.parent_name || '.' || child.name
+FROM (
   SELECT m.id AS method_id,
     (SELECT c.id FROM code_entities c
      WHERE c.file_id = m.file_id
@@ -314,54 +328,63 @@ JOIN (
      ORDER BY c.line_start DESC LIMIT 1) AS parent_name
   FROM code_entities m
   JOIN source_files sf ON sf.id = m.file_id
-  WHERE sf.project_id = @pid
+  WHERE sf.project_id = $project_id
     AND m.entity_kind IN ('method','function')
     AND m.parent_entity_id IS NULL
-) linkage ON linkage.method_id = child.id
-SET child.parent_entity_id = linkage.parent_id,
-    child.qualified_name = CONCAT(linkage.parent_name, '.', child.name)
-WHERE linkage.parent_id IS NOT NULL;
--- Auto-generate file purpose from path structure (algorithmic best-guess)
-UPDATE source_files sf
-SET sf.purpose = CONCAT(
-  REPLACE(
-    REPLACE(
-      REPLACE(
-        SUBSTRING_INDEX(sf.relative_path, '/', -2),
+) AS linkage
+WHERE linkage.method_id = child.id
+  AND linkage.parent_id IS NOT NULL;
+-- Auto-generate file purpose from path structure (algorithmic best-guess): the last two path
+-- segments with ' > ' between them, minus .cs/.php, plus a role suffix. SQLite has no
+-- SUBSTRING_INDEX; rtrim(p, replace(p, '/', '')) cuts p back to its last '/', so applying it
+-- twice gives the prefix to drop.
+UPDATE source_files AS sf
+SET purpose =
+  replace(
+    replace(
+      replace(
+        substr(t.relative_path, length(rtrim(t.dir, replace(t.dir, '/', ''))) + 1),
       '/', ' > '),
     '.cs', ''),
-  '.php', ''),
+  '.php', '') ||
   CASE
-    WHEN sf.relative_path LIKE '%Controller%' THEN ' (controller)'
-    WHEN sf.relative_path LIKE '%Model%' THEN ' (model)'
-    WHEN sf.relative_path LIKE '%View%' OR sf.relative_path LIKE '%cshtml' THEN ' (view)'
-    WHEN sf.relative_path LIKE '%Service%' THEN ' (service)'
-    WHEN sf.relative_path LIKE '%Repository%' THEN ' (repository)'
-    WHEN sf.relative_path LIKE '%Helper%' OR sf.relative_path LIKE '%Util%' THEN ' (utility)'
-    WHEN sf.relative_path LIKE '%Test%' OR sf.relative_path LIKE '%Spec%' THEN ' (test)'
-    WHEN sf.relative_path LIKE '%.js' THEN ' (script)'
-    WHEN sf.relative_path LIKE '%.css' THEN ' (stylesheet)'
-    WHEN sf.relative_path LIKE '%.sql' THEN ' (database script)'
+    WHEN t.relative_path LIKE '%Controller%' THEN ' (controller)'
+    WHEN t.relative_path LIKE '%Model%' THEN ' (model)'
+    WHEN t.relative_path LIKE '%View%' OR t.relative_path LIKE '%cshtml' THEN ' (view)'
+    WHEN t.relative_path LIKE '%Service%' THEN ' (service)'
+    WHEN t.relative_path LIKE '%Repository%' THEN ' (repository)'
+    WHEN t.relative_path LIKE '%Helper%' OR t.relative_path LIKE '%Util%' THEN ' (utility)'
+    WHEN t.relative_path LIKE '%Test%' OR t.relative_path LIKE '%Spec%' THEN ' (test)'
+    WHEN t.relative_path LIKE '%.js' THEN ' (script)'
+    WHEN t.relative_path LIKE '%.css' THEN ' (stylesheet)'
+    WHEN t.relative_path LIKE '%.sql' THEN ' (database script)'
     ELSE ''
   END
-)
-WHERE sf.project_id = @pid AND sf.is_deleted = 0 AND sf.purpose IS NULL;
+FROM (
+  -- dir = the path up to (not including) its last '/', or '' when there is none
+  SELECT id, relative_path, substr(head, 1, length(head) - 1) AS dir
+  FROM (SELECT id, relative_path, rtrim(relative_path, replace(relative_path, '/', '')) AS head
+        FROM source_files
+        WHERE project_id = $project_id AND is_deleted = 0 AND purpose IS NULL)
+) AS t
+WHERE t.id = sf.id;
 SQLFOOTER
 
-  emit "UPDATE projects SET last_scan_at=NOW() WHERE id=$project_id;"
+  emit "UPDATE projects SET last_scan_at=now() WHERE id=$project_id;"
+  emit "COMMIT;"
 
   local sql_size
   sql_size=$(wc -c < "$SQL_FILE" | tr -d ' ')
   echo "    Loading SQL ($(( sql_size / 1024 )) KB)..."
 
-  if mysql_batch "$SQL_FILE"; then
+  if memdb_batch "$SQL_FILE"; then
     local db_files db_entities elapsed
-    db_files=$(mysql_exec "SELECT COUNT(*) FROM source_files WHERE project_id=$project_id AND is_deleted=0")
-    db_entities=$(mysql_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$project_id")
+    db_files=$(memdb_exec "SELECT COUNT(*) FROM source_files WHERE project_id=$project_id AND is_deleted=0")
+    db_entities=$(memdb_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$project_id")
     elapsed=$(( SECONDS - start_time ))
     echo "    DONE: $db_files files, $db_entities entities in ${elapsed}s"
   else
-    echo "    ERROR: MySQL import failed. SQL at $SQL_FILE"
+    echo "    ERROR: memdb import failed (nothing was changed). SQL at $SQL_FILE"
     return 1
   fi
 
@@ -430,9 +453,11 @@ cmd_onboard() {
     [[ -n "$fw" ]] && echo "Auto-detected framework: $fw"
   fi
 
+  # root_path is stored exactly as given (Windows or Git Bash form); session_boot.sh matches the
+  # working directory against it.
   local esc_n esc_p esc_d
   esc_n=$(escape_sql "$name"); esc_p=$(escape_sql "$path"); esc_d=$(escape_sql "$desc")
-  mysql_exec "INSERT INTO projects (slug,name,root_path,primary_language,framework,description) VALUES ('$slug','$esc_n','$esc_p',NULLIF('$lang',''),NULLIF('$fw',''),NULLIF('$esc_d','')) ON DUPLICATE KEY UPDATE name='$esc_n',root_path='$esc_p',primary_language=NULLIF('$lang',''),framework=NULLIF('$fw',''),description=NULLIF('$esc_d','');"
+  memdb_exec "INSERT INTO projects (slug,name,root_path,primary_language,framework,description) VALUES ('$slug','$esc_n','$esc_p',NULLIF('$lang',''),NULLIF('$fw',''),NULLIF('$esc_d','')) ON CONFLICT (slug) DO UPDATE SET name='$esc_n',root_path='$esc_p',primary_language=NULLIF('$lang',''),framework=NULLIF('$fw',''),description=NULLIF('$esc_d','');"
   echo "Registered '$slug'. Scanning..."
   scan_project "$slug"
   echo ""
@@ -443,11 +468,11 @@ cmd_onboard() {
 cmd_status() {
   local slug="${1:-}"
   if [[ -n "$slug" ]]; then
-    mysql_exec "SELECT p.slug,p.name,p.primary_language,p.framework,p.last_scan_at,(SELECT COUNT(*) FROM source_files sf WHERE sf.project_id=p.id AND sf.is_deleted=0),(SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=p.id AND ce.is_deleted=0),(SELECT COUNT(DISTINCT cm.marker) FROM entity_markers em JOIN contextual_markers cm ON cm.id=em.marker_id JOIN code_entities ce ON ce.id=em.entity_id JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=p.id) FROM projects p WHERE p.slug='$slug';" | column -t -s $'\t'
+    memdb_exec "SELECT p.slug,p.name,p.primary_language,p.framework,p.last_scan_at,(SELECT COUNT(*) FROM source_files sf WHERE sf.project_id=p.id AND sf.is_deleted=0),(SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=p.id AND ce.is_deleted=0),(SELECT COUNT(DISTINCT cm.marker) FROM entity_markers em JOIN contextual_markers cm ON cm.id=em.marker_id JOIN code_entities ce ON ce.id=em.entity_id JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=p.id) FROM projects p WHERE p.slug='$slug';" | column -t -s $'\t'
   else
     echo "=== Project Status ==="
     printf "%-20s %-10s %-8s %-8s\n" "PROJECT" "LAST_SCAN" "FILES" "ENTITIES"
-    mysql_exec "SELECT p.slug,IFNULL(DATE_FORMAT(p.last_scan_at,'%m/%d %H:%i'),'never'),(SELECT COUNT(*) FROM source_files sf WHERE sf.project_id=p.id AND sf.is_deleted=0),(SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=p.id AND ce.is_deleted=0) FROM projects p WHERE p.is_active=1 ORDER BY p.slug;" | while IFS=$'\t' read -r s d f e; do
+    memdb_exec "SELECT p.slug,IFNULL(DATE_FORMAT(p.last_scan_at,'%m/%d %H:%i'),'never'),(SELECT COUNT(*) FROM source_files sf WHERE sf.project_id=p.id AND sf.is_deleted=0),(SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=p.id AND ce.is_deleted=0) FROM projects p WHERE p.is_active=1 ORDER BY p.slug;" | while IFS=$'\t' read -r s d f e; do
       printf "%-20s %-10s %-8s %-8s\n" "$s" "$d" "$f" "$e"
     done
   fi
@@ -456,9 +481,12 @@ cmd_status() {
 cmd_reset() {
   local slug="$1"
   local pid
-  pid=$(mysql_exec "SELECT id FROM projects WHERE slug='$slug'")
+  pid=$(memdb_exec "SELECT id FROM projects WHERE slug='$slug'")
   [[ -z "$pid" ]] && { echo "Not found: '$slug'"; return 1; }
-  mysql_exec "SET FOREIGN_KEY_CHECKS=0; DELETE em FROM entity_markers em JOIN code_entities ce ON ce.id=em.entity_id JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$pid; DELETE fm FROM file_markers fm JOIN source_files sf ON sf.id=fm.file_id WHERE sf.project_id=$pid; DELETE FROM code_entities WHERE file_id IN (SELECT id FROM source_files WHERE project_id=$pid); DELETE FROM file_dependencies WHERE source_file_id IN (SELECT id FROM source_files WHERE project_id=$pid); DELETE FROM source_files WHERE project_id=$pid; UPDATE projects SET last_scan_at=NULL WHERE id=$pid; SET FOREIGN_KEY_CHECKS=1;"
+  # Foreign-key enforcement off, as in the scan purge: only the rows named here are deleted.
+  # Note: entity_dependencies is not cleared, so the project's dependency rows are left behind
+  # pointing at the deleted entities (long-standing behaviour, kept as is).
+  memdb_exec "PRAGMA foreign_keys = OFF; BEGIN; DELETE FROM entity_markers WHERE entity_id IN (SELECT ce.id FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$pid); DELETE FROM file_markers WHERE file_id IN (SELECT id FROM source_files WHERE project_id=$pid); DELETE FROM code_entities WHERE file_id IN (SELECT id FROM source_files WHERE project_id=$pid); DELETE FROM file_dependencies WHERE source_file_id IN (SELECT id FROM source_files WHERE project_id=$pid); DELETE FROM source_files WHERE project_id=$pid; UPDATE projects SET last_scan_at=NULL WHERE id=$pid; COMMIT;"
   echo "Cleared '$slug'."
 }
 
@@ -471,13 +499,13 @@ cmd_enrich_export() {
   mkdir -p "$outdir"
 
   local pid
-  pid=$(mysql_exec "SELECT id FROM projects WHERE slug='$slug' AND is_active=1")
+  pid=$(memdb_exec "SELECT id FROM projects WHERE slug='$slug' AND is_active=1")
   [[ -z "$pid" ]] && { echo "ERROR: Project '$slug' not found."; return 1; }
 
   # Get count of entities without markers
   local total unenriched
-  total=$(mysql_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$pid AND ce.is_deleted=0")
-  unenriched=$(mysql_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id LEFT JOIN entity_markers em ON em.entity_id=ce.id WHERE sf.project_id=$pid AND ce.is_deleted=0 AND em.entity_id IS NULL")
+  total=$(memdb_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$pid AND ce.is_deleted=0")
+  unenriched=$(memdb_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id LEFT JOIN entity_markers em ON em.entity_id=ce.id WHERE sf.project_id=$pid AND ce.is_deleted=0 AND em.entity_id IS NULL")
 
   echo "=== Enrich Export: $slug ==="
   echo "    Total entities: $total"
@@ -489,7 +517,7 @@ cmd_enrich_export() {
   local entity_in_batch=0
   local BATCH_SIZE=50
 
-  mysql_exec "
+  memdb_exec "
     SELECT sf.relative_path, ce.id, ce.entity_kind, ce.name,
            IFNULL(ce.qualified_name,''), IFNULL(ce.signature,''),
            ce.line_start, IFNULL(ce.visibility,''), IFNULL(ce.purpose,'')
@@ -517,16 +545,17 @@ cmd_enrich_export() {
   batch_count=$(ls "$outdir"/batch_*.txt 2>/dev/null | wc -l)
   echo "    Exported $batch_count batch files to $outdir/"
   echo ""
-  echo "To enrich, read each batch file and generate SQL like:"
+  echo "To enrich, read each batch file and generate SQL (SQLite, run with memdb -f <file>) like:"
   echo "  -- NOTE: contextual_markers has only (id, marker) — no description column"
-  echo "  INSERT IGNORE INTO contextual_markers (marker) VALUES ('marker1'),('marker2');"
-  echo "  INSERT IGNORE INTO entity_markers (entity_id, marker_id, confidence)"
+  echo "  -- Strings: double a single quote (''); a backslash needs no escaping"
+  echo "  INSERT OR IGNORE INTO contextual_markers (marker) VALUES ('marker1'),('marker2');"
+  echo "  INSERT OR IGNORE INTO entity_markers (entity_id, marker_id, confidence)"
   echo "    SELECT <entity_id>, id, <confidence> FROM contextual_markers WHERE marker='<marker>';"
   echo "  -- Also update entity purposes:"
   echo "  UPDATE code_entities SET purpose = '<description>' WHERE id = <entity_id>;"
   echo ""
   echo "  -- For file-level markers:"
-  echo "  INSERT IGNORE INTO file_markers (file_id, marker_id, confidence)"
+  echo "  INSERT OR IGNORE INTO file_markers (file_id, marker_id, confidence)"
   echo "    SELECT <file_id>, id, <confidence> FROM contextual_markers WHERE marker='<marker>';"
 }
 
@@ -550,7 +579,7 @@ cmd_deps() {
 
   # Step 1: Get distinctive type names
   local PATTERN_FILE="/tmp/claude_deps_names_${slug}.txt"
-  mysql_exec "
+  memdb_exec "
     SELECT DISTINCT ce.name
     FROM code_entities ce
     JOIN source_files sf ON sf.id = ce.file_id
@@ -624,15 +653,13 @@ cmd_deps() {
     SQL_FILE="/tmp/claude_deps_${slug}_chunk${chunk_num}.sql"
 
     cat > "$SQL_FILE" << SQLHEADER
-USE {{DB_NAME}};
-SET @pid = $P_ID;
-
-DROP TEMPORARY TABLE IF EXISTS _type_refs;
-CREATE TEMPORARY TABLE _type_refs (
-  ref_file VARCHAR(500) NOT NULL,
-  type_name VARCHAR(255) NOT NULL,
-  KEY (type_name)
-) ENGINE=MEMORY;
+BEGIN;
+DROP TABLE IF EXISTS temp._type_refs;
+CREATE TEMP TABLE _type_refs (
+  ref_file TEXT NOT NULL COLLATE NOCASE,
+  type_name TEXT NOT NULL COLLATE NOCASE
+);
+CREATE INDEX temp.ix_type_refs_name ON _type_refs (type_name);
 SQLHEADER
 
     # Batch insert the matches (500 per INSERT)
@@ -658,18 +685,19 @@ SQLHEADER
     [[ -n "$values" ]] && emit "INSERT INTO _type_refs VALUES $values;"
 
     # Join: create 'uses' dependencies where ref_file has a type that references another type
-    cat >> "$SQL_FILE" << 'SQLDEPS'
+    # (unquoted heredoc: only $P_ID is substituted)
+    cat >> "$SQL_FILE" << SQLDEPS
 
 -- Create 'uses' deps: type in ref_file -> referenced type (different file only)
-INSERT IGNORE INTO entity_dependencies (caller_id, callee_id, dependency_type)
+INSERT OR IGNORE INTO entity_dependencies (caller_id, callee_id, dependency_type)
 SELECT DISTINCT caller.id, callee.id, 'uses'
 FROM _type_refs tr
 JOIN code_entities callee ON callee.name = tr.type_name
   AND callee.entity_kind IN ('class','interface','struct','enum')
   AND callee.is_deleted = 0
 JOIN source_files sf_callee ON sf_callee.id = callee.file_id
-  AND sf_callee.project_id = @pid
-JOIN source_files sf_caller ON sf_caller.project_id = @pid
+  AND sf_callee.project_id = $P_ID
+JOIN source_files sf_caller ON sf_caller.project_id = $P_ID
   AND sf_caller.relative_path = tr.ref_file
   AND sf_caller.is_deleted = 0
 JOIN code_entities caller ON caller.file_id = sf_caller.id
@@ -677,13 +705,14 @@ JOIN code_entities caller ON caller.file_id = sf_caller.id
   AND caller.is_deleted = 0
 WHERE sf_caller.id != sf_callee.id;
 
-SELECT CONCAT('Inserted ', ROW_COUNT(), ' dependencies');
-DROP TEMPORARY TABLE IF EXISTS _type_refs;
+SELECT concat('Inserted ', changes(), ' dependencies');
+DROP TABLE IF EXISTS temp._type_refs;
+COMMIT;
 SQLDEPS
 
     echo "    Chunk $chunk_num: loading..."
 
-    if mysql_batch "$SQL_FILE"; then
+    if memdb_batch "$SQL_FILE"; then
       echo "    Chunk $chunk_num: done"
     else
       echo "    ERROR: Chunk $chunk_num failed. SQL at $SQL_FILE"
@@ -693,9 +722,9 @@ SQLDEPS
   done
 
   local dep_count elapsed
-  dep_count=$(mysql_exec "SELECT COUNT(*) FROM entity_dependencies ed JOIN code_entities ce ON ce.id = ed.caller_id JOIN source_files sf ON sf.id = ce.file_id WHERE sf.project_id = $P_ID")
+  dep_count=$(memdb_exec "SELECT COUNT(*) FROM entity_dependencies ed JOIN code_entities ce ON ce.id = ed.caller_id JOIN source_files sf ON sf.id = ce.file_id WHERE sf.project_id = $P_ID")
   elapsed=$(( SECONDS - start_time ))
-  echo "    DONE: $dep_count project deps (total DB: $(mysql_exec 'SELECT COUNT(*) FROM entity_dependencies')) in ${elapsed}s"
+  echo "    DONE: $dep_count project deps (total DB: $(memdb_exec 'SELECT COUNT(*) FROM entity_dependencies')) in ${elapsed}s"
 
   rm -f "$PATTERN_FILE" "$MATCHED_FILE"
 }
@@ -705,7 +734,7 @@ SQLDEPS
 # ============================================================
 load_project_info() {
   local slug="$1"
-  PROJECT_INFO=$(mysql_exec "SELECT id, root_path, IFNULL(primary_language,''), IFNULL(framework,'') FROM projects WHERE slug='$slug' AND is_active=1")
+  PROJECT_INFO=$(memdb_exec "SELECT id, root_path, IFNULL(primary_language,''), IFNULL(framework,'') FROM projects WHERE slug='$slug' AND is_active=1")
   if [[ -z "$PROJECT_INFO" ]]; then
     echo "ERROR: Project '$slug' not found."
     return 1
@@ -781,7 +810,7 @@ cmd_check() {
 
   build_current_filelist "$P_UNIX" "$exclude_pat" "$current"
 
-  mysql_exec "SELECT relative_path, IFNULL(file_hash,'') FROM source_files WHERE project_id=$P_ID AND is_deleted=0 ORDER BY relative_path" > "$db_files"
+  memdb_exec "SELECT relative_path, IFNULL(file_hash,'') FROM source_files WHERE project_id=$P_ID AND is_deleted=0 ORDER BY relative_path" > "$db_files"
 
   diff_file_lists "$current" "$db_files" "$new_list" "$mod_list" "$del_list"
 
@@ -856,7 +885,7 @@ cmd_update() {
 
   build_current_filelist "$P_UNIX" "$exclude_pat" "$current"
 
-  mysql_exec "SELECT relative_path, IFNULL(file_hash,'') FROM source_files WHERE project_id=$P_ID AND is_deleted=0 ORDER BY relative_path" > "$db_files"
+  memdb_exec "SELECT relative_path, IFNULL(file_hash,'') FROM source_files WHERE project_id=$P_ID AND is_deleted=0 ORDER BY relative_path" > "$db_files"
 
   if [[ -n "$force_file" ]]; then
     # Force mode: only process the specified file
@@ -886,11 +915,10 @@ cmd_update() {
     return 0
   fi
 
-  # Build SQL for changes
+  # Build SQL for changes (foreign keys stay enforced here, so deletes cascade)
   SQL_FILE="/tmp/claude_update_${slug}.sql"
   cat > "$SQL_FILE" << SQLHEADER
-USE {{DB_NAME}};
-SET @pid = $P_ID;
+BEGIN;
 SQLHEADER
 
   # Handle deleted files — mark as deleted (preserves history)
@@ -899,8 +927,8 @@ SQLHEADER
     while IFS= read -r del_path; do
       local esc_del
       esc_del=$(escape_sql "$del_path")
-      emit "UPDATE source_files SET is_deleted=1 WHERE project_id=@pid AND relative_path='$esc_del';"
-      emit "UPDATE code_entities SET is_deleted=1 WHERE file_id=(SELECT id FROM source_files WHERE project_id=@pid AND relative_path='$esc_del');"
+      emit "UPDATE source_files SET is_deleted=1 WHERE project_id=$P_ID AND relative_path='$esc_del';"
+      emit "UPDATE code_entities SET is_deleted=1 WHERE file_id=(SELECT id FROM source_files WHERE project_id=$P_ID AND relative_path='$esc_del');"
     done < "$del_list"
   fi
 
@@ -914,7 +942,7 @@ SQLHEADER
       hash=$(printf '%s' "$meta" | cut -f2)
       lc=$(printf '%s' "$meta" | cut -f3)
       ext=$(printf '%s' "$meta" | cut -f4)
-      emit "INSERT INTO source_files (project_id,relative_path,file_type,line_count,file_hash,last_scanned_at,is_deleted) VALUES (@pid,'$esc_path','$ext',$lc,'$hash',NOW(),0) ON DUPLICATE KEY UPDATE line_count=$lc,file_hash='$hash',last_scanned_at=NOW(),is_deleted=0;"
+      emit "INSERT INTO source_files (project_id,relative_path,file_type,line_count,file_hash,last_scanned_at,is_deleted) VALUES ($P_ID,'$esc_path','$ext',$lc,'$hash',now(),0) ON CONFLICT (project_id,relative_path) DO UPDATE SET line_count=$lc,file_hash='$hash',last_scanned_at=now(),is_deleted=0;"
     done < "$new_list"
   fi
 
@@ -926,9 +954,9 @@ SQLHEADER
       meta=$(awk -F'\t' -v f="$mod_path" '$1==f{print; exit}' "$current")
       hash=$(printf '%s' "$meta" | cut -f2)
       lc=$(printf '%s' "$meta" | cut -f3)
-      emit "UPDATE source_files SET line_count=$lc, file_hash='$hash', last_scanned_at=NOW() WHERE project_id=@pid AND relative_path='$esc_path';"
+      emit "UPDATE source_files SET line_count=$lc, file_hash='$hash', last_scanned_at=now() WHERE project_id=$P_ID AND relative_path='$esc_path';"
       # Remove old entities for this file (markers and deps cascade)
-      emit "DELETE ce FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=@pid AND sf.relative_path='$esc_path';"
+      emit "DELETE FROM code_entities WHERE file_id IN (SELECT id FROM source_files WHERE project_id=$P_ID AND relative_path='$esc_path');"
     done < "$mod_list"
   fi
 
@@ -1029,10 +1057,12 @@ SQLHEADER
     rm -f "$ENTITY_FILE" "$affected_list"
   fi
 
-  # Post-processing: re-link parent entities
-  cat >> "$SQL_FILE" << 'SQLFOOTER'
-UPDATE code_entities child
-JOIN (
+  # Post-processing: re-link parent entities (unquoted heredoc: only $P_ID is substituted)
+  cat >> "$SQL_FILE" << SQLFOOTER
+UPDATE code_entities AS child
+SET parent_entity_id = linkage.parent_id,
+    qualified_name = linkage.parent_name || '.' || child.name
+FROM (
   SELECT m.id AS method_id,
     (SELECT c.id FROM code_entities c
      WHERE c.file_id = m.file_id
@@ -1046,29 +1076,29 @@ JOIN (
      ORDER BY c.line_start DESC LIMIT 1) AS parent_name
   FROM code_entities m
   JOIN source_files sf ON sf.id = m.file_id
-  WHERE sf.project_id = @pid
+  WHERE sf.project_id = $P_ID
     AND m.entity_kind IN ('method','function')
     AND m.parent_entity_id IS NULL
-) linkage ON linkage.method_id = child.id
-SET child.parent_entity_id = linkage.parent_id,
-    child.qualified_name = CONCAT(linkage.parent_name, '.', child.name)
-WHERE linkage.parent_id IS NOT NULL;
+) AS linkage
+WHERE linkage.method_id = child.id
+  AND linkage.parent_id IS NOT NULL;
 SQLFOOTER
 
-  emit "UPDATE projects SET last_scan_at=NOW() WHERE id=$P_ID;"
+  emit "UPDATE projects SET last_scan_at=now() WHERE id=$P_ID;"
+  emit "COMMIT;"
 
   local sql_size
   sql_size=$(wc -c < "$SQL_FILE" | tr -d ' ')
   echo "    Loading SQL ($(( sql_size / 1024 )) KB)..."
 
-  if mysql_batch "$SQL_FILE"; then
+  if memdb_batch "$SQL_FILE"; then
     local db_file_count db_entity_count elapsed
-    db_file_count=$(mysql_exec "SELECT COUNT(*) FROM source_files WHERE project_id=$P_ID AND is_deleted=0")
-    db_entity_count=$(mysql_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$P_ID AND ce.is_deleted=0")
+    db_file_count=$(memdb_exec "SELECT COUNT(*) FROM source_files WHERE project_id=$P_ID AND is_deleted=0")
+    db_entity_count=$(memdb_exec "SELECT COUNT(*) FROM code_entities ce JOIN source_files sf ON sf.id=ce.file_id WHERE sf.project_id=$P_ID AND ce.is_deleted=0")
     elapsed=$(( SECONDS - start_time ))
     echo "    DONE: $db_file_count files, $db_entity_count entities (${elapsed}s)"
   else
-    echo "    ERROR: MySQL import failed. SQL at $SQL_FILE"
+    echo "    ERROR: memdb import failed (nothing was changed). SQL at $SQL_FILE"
     rm -f "$current" "$db_files" "$new_list" "$mod_list" "$del_list"
     return 1
   fi
@@ -1080,7 +1110,7 @@ SQLFOOTER
 # Check-all / Update-all
 # ============================================================
 cmd_check_all() {
-  for s in $(mysql_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
+  for s in $(memdb_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
     cmd_check "$s"
     echo ""
   done
@@ -1089,7 +1119,7 @@ cmd_check_all() {
 cmd_update_all() {
   echo "=== Incremental update all projects ==="
   local total_start=$SECONDS
-  for s in $(mysql_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
+  for s in $(memdb_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
     cmd_update "$s" || echo "WARN: '$s' failed, continuing..."
   done
   echo "=== Complete in $(( SECONDS - total_start ))s ==="
@@ -1107,7 +1137,7 @@ case "${1:-help}" in
   scan-all)
     echo "=== Scanning all projects ==="
     total_start=$SECONDS
-    for s in $(mysql_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
+    for s in $(memdb_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
       scan_project "$s" || echo "WARN: '$s' failed, continuing..."
     done
     echo "=== Complete in $(( SECONDS - total_start ))s ==="
@@ -1132,7 +1162,7 @@ case "${1:-help}" in
     cmd_deps "$2"
     ;;
   deps-all)
-    for s in $(mysql_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
+    for s in $(memdb_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
       cmd_deps "$s"
     done
     ;;
@@ -1141,16 +1171,23 @@ case "${1:-help}" in
     cmd_enrich_export "$2"
     ;;
   enrich-all)
-    for s in $(mysql_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
+    for s in $(memdb_exec "SELECT slug FROM projects WHERE is_active=1 ORDER BY slug"); do
       cmd_enrich_export "$s"
     done
     ;;
   migrate-history)
+    # Legacy one-off: drives migrate_history.py, a migration helper that is NOT shipped with
+    # this bundle. Without it the command stops here.
     [[ -z "${2:-}" ]] && { echo "Usage: $0 migrate-history <slug> [--max-batches N]"; exit 1; }
+    if [[ ! -f "$(dirname "$0")/migrate_history.py" ]]; then
+      echo "ERROR: migrate-history needs migrate_history.py next to this script."
+      echo "  It is a one-off legacy migration helper and is not included in this bundle."
+      exit 1
+    fi
     slug="$2"; shift 2
-    pid=$(mysql_exec "SELECT id FROM projects WHERE slug='$slug' AND is_active=1")
+    pid=$(memdb_exec "SELECT id FROM projects WHERE slug='$slug' AND is_active=1")
     [[ -z "$pid" ]] && { echo "ERROR: Project '$slug' not found."; exit 1; }
-    root=$(mysql_exec "SELECT root_path FROM projects WHERE slug='$slug'")
+    root=$(memdb_exec "SELECT root_path FROM projects WHERE slug='$slug'")
     # Derive the project key directory from the root path
     norm_root=$(echo "$root" | sed 's|[\\:/]|-|g; s|^-||; s|-$||')
     project_key_dir="$HOME/.claude/projects/$norm_root"
@@ -1180,7 +1217,7 @@ case "${1:-help}" in
     cmd_reset "$2"
     ;;
   help|*)
-    echo "claude_scanner.sh - Scan projects for {{DB_NAME}}"
+    echo "claude_scanner.sh - Scan projects for claude_memory"
     echo "  scan <slug>           Full re-scan a project"
     echo "  scan-all              Full re-scan all projects"
     echo "  check <slug>          Check for file changes (read-only)"
@@ -1197,6 +1234,7 @@ case "${1:-help}" in
     echo "  enrich-all            Export for all projects"
     echo "  migrate-history <slug> [--max-batches N]"
     echo "                        Export JSONL transcripts as batch files for DB migration"
+    echo "                        (needs migrate_history.py, which is not included)"
     echo "  status [slug]         Show scan stats"
     echo "  reset <slug>          Clear scan data"
     ;;
