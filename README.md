@@ -1,4 +1,4 @@
-# claude-memory
+# AgenticMemory
 
 Database-backed long-term memory for Claude Code. Every session boots from a local MySQL database
 and writes back to it as it works; every raw transcript is archived losslessly and indexed for
@@ -84,8 +84,8 @@ into bash and PowerShell commands unquoted. Use an account that only listens on 
 1. Install the requirements above and make sure MySQL is running.
 2. Clone this repo anywhere:
    ```
-   git clone https://github.com/damianGray77/claude-memory.git
-   cd claude-memory
+   git clone https://github.com/damianGray77/AgenticMemory.git
+   cd AgenticMemory
    ```
 3. Run the installer from a normal PowerShell window (not from inside a sandboxed app):
    ```
