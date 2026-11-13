@@ -223,17 +223,34 @@ else
   echo ""
 fi
 
-# --- Step 8: Check if daily consolidation needed ---
-LAST_CONSOL=$(run_sql "
-  SELECT COALESCE(date(MAX(started_at)), '1970-01-01') FROM sessions
-  WHERE summary LIKE '%[consolidation]%';")
-TODAY=$(date +%Y-%m-%d)
-if [ "$LAST_CONSOL" != "$TODAY" ]; then
-  UNCONSOLIDATED=$(run_sql "SELECT COUNT(*) FROM session_notes WHERE is_consolidated = 0;")
-  echo "=== CONSOLIDATION NEEDED ==="
-  echo "$UNCONSOLIDATED unconsolidated notes (last consolidation: $LAST_CONSOL)"
+# --- Step 8: Consolidation status ---
+# The judgment pass (consolidate-memory-db; the optional ClaudeMemoryConsolidation task runs it
+# every 3h) records every action in consolidation_log. The daily mechanical pass (mechanical_run,
+# decay_observation) is not a judgment pass, so it does not count. Notes the pass deferred carry
+# last_reviewed and are skipped for review_interval_days: they are counted apart from notes due.
+# NEEDED = notes are due and the last pass is 6h+ old (two scheduled runs missed), or none ever ran.
+IFS=$'\t' read -r LAST_CONSOL CONSOL_AGE NOTES_DUE NOTES_HELD <<< "$(run_sql "
+  WITH last AS (
+    SELECT MAX(created_at) AS at FROM consolidation_log
+    WHERE dry_run = 0 AND reverted = 0
+      AND action NOT IN ('mechanical_run', 'decay_observation', 'error')
+  ), cfg AS (
+    SELECT COALESCE((SELECT CAST(cfg_value AS INTEGER) FROM consolidation_config
+                     WHERE cfg_key = 'review_interval_days'), 30) AS days
+  )
+  SELECT COALESCE(strftime('%Y-%m-%d %H:%M', last.at), 'never'),
+         COALESCE(CAST((julianday(now()) - julianday(last.at)) * 24 AS INTEGER), -1),
+         (SELECT COUNT(*) FROM session_notes WHERE is_consolidated = 0
+            AND (last_reviewed IS NULL OR last_reviewed < datetime(now(), '-' || cfg.days || ' days'))),
+         (SELECT COUNT(*) FROM session_notes WHERE is_consolidated = 0
+            AND last_reviewed >= datetime(now(), '-' || cfg.days || ' days'))
+  FROM last, cfg;")"
+LAST_CONSOL=${LAST_CONSOL:-never}
+if [ "$LAST_CONSOL" = "never" ]; then CONSOL_WHEN="never"; else CONSOL_WHEN="$LAST_CONSOL (${CONSOL_AGE}h ago)"; fi
+if [ "$LAST_CONSOL" = "never" ] || { [ "${NOTES_DUE:-0}" -gt 0 ] && [ "${CONSOL_AGE:-0}" -ge 6 ]; }; then
+  echo "=== CONSOLIDATION NEEDED: last judgment pass $CONSOL_WHEN; ${NOTES_DUE:-?} notes due, ${NOTES_HELD:-?} deferred ==="
 else
-  echo "=== CONSOLIDATION: up to date ==="
+  echo "=== CONSOLIDATION: last judgment pass $CONSOL_WHEN; ${NOTES_DUE:-?} notes due, ${NOTES_HELD:-?} deferred ==="
 fi
 
 # --- Step 8b: Memory confirmation (~/.claude/consolidator/confirm.sql) ---
