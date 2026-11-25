@@ -2,8 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(\"{{MEMDB_POSIX}}\":*)",
-      "Bash(python -I \"{{CLAUDE_HOME_JSON}}\\skills\\:*)",
-      "Bash(powershell -NoProfile -ExecutionPolicy Bypass -File \"{{CLAUDE_HOME_JSON}}\\skills\\memory\\scripts\\mem.ps1\":*)",
+      "Bash(python -I:*)",
       "Bash(date:*)",
       "Read",
       "Skill"

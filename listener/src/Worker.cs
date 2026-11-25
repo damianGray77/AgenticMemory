@@ -58,7 +58,8 @@ public sealed class Worker
         var psi = new ProcessStartInfo("cmd.exe")
         {
             ArgumentList = { "/c", _claude, "-p", "--output-format", "json", "--model", _model,
-                             "--settings", _settings, "--permission-mode", "auto", "--permission-prompts", "none" },
+                             "--settings", _settings, "--permission-mode", "auto", "--permission-prompts", "none",
+                             "--name", TitleFor(request) },
             WorkingDirectory = @"{{LISTENER_ROOT_WIN}}",
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -156,6 +157,20 @@ public sealed class Worker
             line = cut > 0 ? line[..(cut + 1)] : line[..400];
         }
         Say((isError ? "That task hit a problem. " : "") + line);
+    }
+
+    // Desktop-app session title: the restated request, one line, cut at a word boundary. Quotes are
+    // stripped because the name travels through cmd.exe /c.
+    static string TitleFor(string request)
+    {
+        var t = string.Join(' ', request.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            .Replace("\"", "").Replace("&", "and").Replace("|", " ").Replace("<", "").Replace(">", "").Replace("%", "").Replace("^", "");
+        if (t.Length > 80)
+        {
+            var sp = t.LastIndexOf(' ', 80);
+            t = t[..(sp > 40 ? sp : 80)] + "...";
+        }
+        return t.Length > 0 ? t : "Voice task";
     }
 
     void Finish(long id, string notes) =>

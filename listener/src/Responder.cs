@@ -92,7 +92,9 @@ public sealed partial class Responder : IDisposable
         "answers), digest_lines; full-text " +
         "search via <table>_fts with fts_any('words'). Use a lookup when the question needs one, keep it to a " +
         "couple of quick LIMITed queries, and never write to the database. The schema is at " +
-        @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + " if you need it.\n\n" +
+        @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + " if you need it. For {{USER_NAME}}'s EmailTodo task list " +
+        "(what's overdue, due today, who he owes replies to), run the read-only todo script: " +
+        "python -I \"" + @"{{CLAUDE_HOME_WIN}}\skills\todo\scripts\todo.py" + "\" list | task <key> | recent.\n\n" +
         "When you are about to use a tool, FIRST write one short sentence saying what you're checking (\"Let me " +
         "check the notes.\") -- it is spoken aloud while the lookup runs, so {{USER_NAME}} isn't left in silence.\n\n" +
         "Control outputs -- when one applies it must be the VERY FIRST characters of the reply:\n" +
