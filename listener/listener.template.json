@@ -1,5 +1,5 @@
 {
-  "Database": "{{DB_PATH_WIN}}",
+  "Database": "{{DB_PATH_JSON}}",
   "Model": "parakeet",
   "Microphone": "",
   "DenoiseSpeech": false,

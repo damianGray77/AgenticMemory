@@ -28,8 +28,10 @@ and voice enrollment (step 4) are always manual.
 1. Fill the tokens: copy `src\` to `C:\Tools\listener\src`, replacing `{{USER_NAME}}` with your
    name (e.g. `Damian`), `{{USER_NAME_LOWER}}` with its lowercase (`damian`), and the path tokens
    with their values (`{{DB_PATH_WIN}}` -> the memory database path). Copy
-   `listener.template.json` to `C:\Tools\listener\listener.json` and fill it the same way; put the
-   names and jargon you want transcribed correctly in `Prompt` (used by the Whisper engine only).
+   `listener.template.json` to `C:\Tools\listener\listener.json` and fill it the same way, except
+   that its `{{DB_PATH_JSON}}` is the database path with every backslash doubled, as a JSON string
+   needs (`C:\\Users\\...`); put the names and jargon you want transcribed correctly in `Prompt`
+   (used by the Whisper engine only).
 2. Models into `C:\Tools\listener\models` (easiest: copy the whole folder from an existing machine):
 
    | Path | What | Source |

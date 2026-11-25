@@ -41,6 +41,9 @@ function Get-TokenMap {
         MEMDB_WIN               = $memdb.Win
         MEMDB_POSIX             = $memdb.Posix
         DB_PATH_WIN             = $db.Win
+        # The same path as it appears INSIDE a JSON string ("C:\\Users\\..."), for listener.json:
+        # with single backslashes the seeded file is not valid JSON and the listener cannot start.
+        DB_PATH_JSON            = $db.Win.Replace('\', '\\')
         CLAUDE_HOME_WIN         = $home_.Win
         CLAUDE_HOME_FWD         = $home_.Fwd
         CLAUDE_HOME_POSIX       = $home_.Posix
