@@ -57,6 +57,7 @@ public sealed partial class Responder : IDisposable
     ];
     readonly SpeechSynthesizer _sapi = new();      // the fallback voice
     readonly OfflineTts? _kokoro;                  // the voice with personality (sherpa-onnx), when its model is there
+    PronunciationLexicon? _lexicon;                // pre-TTS word lookup; unknown words get a guess added
     int _kokoroVoice;
     float _kokoroSpeed;
 
@@ -99,9 +100,10 @@ public sealed partial class Responder : IDisposable
         "you even when they talk ABOUT you or your plumbing -- answer them.\n" +
         "[TASK] <one-line restatement of the request> -- when {{USER_NAME}} asks for real WORK: changing code or " +
         "files, commits, running or scheduling jobs, tickets, emails, anything beyond conversation and quick " +
-        "lookups. Do not attempt the work; that line hands it to his main working session. The marker and " +
-        "restatement must be your FIRST line (never at the end); anything you put on the lines AFTER it is " +
-        "spoken aloud to {{USER_NAME}} as your acknowledgment.\n\n" +
+        "lookups. Do not attempt the work; that line hands it to a background worker session that starts on " +
+        "it immediately, speaks its result here when done, and appears in {{USER_NAME}}'s Claude desktop app. The " +
+        "marker and restatement must be your FIRST line (never at the end); anything you put on the lines " +
+        "AFTER it is spoken aloud to {{USER_NAME}} as your acknowledgment.\n\n" +
         "Reply with just: ready";
 
     public Responder(string claudePath, string model, string settingsPath, string kokoroDir, int kokoroVoice, float kokoroSpeed,
@@ -129,8 +131,10 @@ public sealed partial class Responder : IDisposable
             config.Model.Kokoro.Tokens = Path.Combine(kokoroDir, "tokens.txt");
             config.Model.Kokoro.DataDir = Path.Combine(kokoroDir, "espeak-ng-data");
             // The multi-lang v1.0 layout: sherpa-onnx 2.x tokenizes English through these lexicons.
-            var lexicons = new[] { "lexicon-us-en.txt", "lexicon-gb-en.txt" }
+            // lexicon-custom.txt (auto-grown by PronunciationLexicon) goes last so its entries win.
+            var lexicons = new[] { "lexicon-us-en.txt", "lexicon-gb-en.txt", PronunciationLexicon.CustomFileName }
                 .Select(f => Path.Combine(kokoroDir, f)).Where(File.Exists).ToArray();
+            _lexicon = new PronunciationLexicon(kokoroDir, log);
             if (lexicons.Length > 0) config.Model.Kokoro.Lexicon = string.Join(",", lexicons);
             var dict = Path.Combine(kokoroDir, "dict");
             if (Directory.Exists(dict)) config.Model.Kokoro.DictDir = dict;
@@ -336,10 +340,23 @@ public sealed partial class Responder : IDisposable
         if (_kokoro == null) return null;
         try
         {
-            var audio = _kokoro.Generate(text, _kokoroSpeed, _kokoroVoice);
+            // Kokoro drops words on long or symbol-heavy input, so feed it short, normalized pieces
+            // and stitch the audio back together with a short pause between them.
+            var samples = new List<float>();
+            var rate = 24000;
+            var normalized = NormalizeForTts(text);
+            _lexicon?.EnsureWords(normalized);
+            foreach (var piece in SplitForTts(normalized))
+            {
+                var audio = _kokoro.Generate(piece, _kokoroSpeed, _kokoroVoice);
+                if (audio.Samples.Length == 0) continue;
+                rate = audio.SampleRate;
+                samples.AddRange(audio.Samples);
+                samples.AddRange(new float[rate / 12]);   // ~80 ms gap
+            }
             var wav = $@"{{LISTENER_ROOT_WIN}}\reply{(n > 0 ? "-" + n : "")}.wav";
-            if (audio.Samples.Length == 0 || !audio.SaveToWaveFile(wav))
-                throw new InvalidOperationException($"Kokoro produced {audio.Samples.Length} samples; save failed");
+            if (samples.Count == 0 || !WritePcm16Wav(wav, samples, rate))
+                throw new InvalidOperationException($"Kokoro produced {samples.Count} samples; save failed");
             return wav;
         }
         catch (Exception ex)
@@ -347,6 +364,61 @@ public sealed partial class Responder : IDisposable
             _log?.Invoke($"Kokoro failed ({ex.Message}); using SAPI for: {text}");
             return null;
         }
+    }
+
+    const int MaxTtsChunk = 140;   // chars; beyond this Kokoro starts skipping words
+
+    /// <summary>Replace tokens the phonemizer mangles (markdown, URLs, symbols, odd punctuation) with speakable text.</summary>
+    static string NormalizeForTts(string text)
+    {
+        var s = text;
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"https?://\S+", "a link");
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"[`*_#>~|^]+", " ");
+        s = s.Replace('‘', '\'').Replace('’', '\'').Replace('“', '"').Replace('”', '"')
+             .Replace("…", ".").Replace("—", ", ").Replace("–", ", ").Replace(" - ", ", ")
+             .Replace("&", " and ").Replace("%", " percent").Replace("+", " plus ").Replace("=", " equals ")
+             .Replace("@", " at ").Replace("/", " slash ").Replace("\\", " ").Replace("\"", "")
+             .Replace("(", ", ").Replace(")", ", ").Replace("[", " ").Replace("]", " ")
+             .Replace("{", " ").Replace("}", " ").Replace("<", " ").Replace(";", ",").Replace(":", ",");
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"(?<=\w)_(?=\w)", " ");
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"[^ -~À-ɏ]", " ");   // emoji, control chars
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\s*,(\s*,)+", ",");
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\s+", " ").Trim();
+        return s;
+    }
+
+    /// <summary>Cut text into short pieces at sentence ends, then commas, then spaces.</summary>
+    static IEnumerable<string> SplitForTts(string text)
+    {
+        var parts = System.Text.RegularExpressions.Regex.Split(text, @"(?<=[.!?])\s+");
+        foreach (var part in parts)
+        {
+            var rest = part.Trim();
+            while (rest.Length > MaxTtsChunk)
+            {
+                var cut = rest.LastIndexOf(", ", MaxTtsChunk, StringComparison.Ordinal);
+                if (cut < MaxTtsChunk / 3) cut = rest.LastIndexOf(' ', MaxTtsChunk);
+                if (cut < 1) cut = MaxTtsChunk;
+                yield return rest[..(cut + 1)].Trim();
+                rest = rest[(cut + 1)..].Trim();
+            }
+            if (rest.Length > 0 && rest.Any(char.IsLetterOrDigit)) yield return rest;
+        }
+    }
+
+    static bool WritePcm16Wav(string path, List<float> samples, int rate)
+    {
+        try
+        {
+            using var w = new BinaryWriter(File.Create(path));
+            var bytes = samples.Count * 2;
+            w.Write("RIFF"u8); w.Write(36 + bytes); w.Write("WAVEfmt "u8);
+            w.Write(16); w.Write((short)1); w.Write((short)1); w.Write(rate); w.Write(rate * 2); w.Write((short)2); w.Write((short)16);
+            w.Write("data"u8); w.Write(bytes);
+            foreach (var f in samples) w.Write((short)(Math.Clamp(f, -1f, 1f) * 32767));
+            return true;
+        }
+        catch { return false; }
     }
 
     void PlayChunk(string? wav, string text)

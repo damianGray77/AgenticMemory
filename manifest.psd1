@@ -58,6 +58,7 @@
         'src\Embedder.cs'
         'src\Microphone.cs'
         'src\Program.cs'
+        'src\PronunciationLexicon.cs'
         'src\Responder.cs'
         'src\Salience.cs'
         'src\SoundTagger.cs'

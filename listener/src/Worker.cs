@@ -17,18 +17,20 @@ public sealed class Worker
     readonly string _model;
     readonly string _settings;
     readonly TimeSpan _timeout;
+    readonly bool _adopt;                            // surface each finished run in the desktop app
     readonly Action<string, (string Name, object Value)[]> _exec;
     readonly Func<string, bool> _speak;              // Responder.AskAloud: false while the room is mid-conversation
     readonly Action<string>? _log;
     readonly SemaphoreSlim _oneAtATime = new(1, 1);  // serial: two unattended workers racing helps nobody
 
-    public Worker(string claudePath, string model, string settingsPath, int timeoutMinutes,
+    public Worker(string claudePath, string model, string settingsPath, int timeoutMinutes, bool adopt,
         Action<string, (string Name, object Value)[]> exec, Func<string, bool> speak, Action<string>? log)
     {
         _claude = claudePath;
         _model = model;
         _settings = settingsPath;
         _timeout = TimeSpan.FromMinutes(timeoutMinutes);
+        _adopt = adopt;
         _exec = exec;
         _speak = speak;
         _log = log;
@@ -125,6 +127,25 @@ public sealed class Worker
         Finish(id, note.Length > 4000 ? note[..4000] : note);
         _log?.Invoke($"Worker task {id} {(isError ? "FAILED" : "done")} in {clock.Elapsed.TotalMinutes:0.0}m " +
                      $"(exit {proc.ExitCode}, session {sessionId ?? "none"}): {result ?? "(no result)"}");
+
+        // Surface the finished run as a session in the Claude desktop app ({{USER_NAME}}: a voice-created
+        // task session should ALWAYS be visible there). `--desktop` refuses redirected output, so
+        // the child keeps its own hidden console and all we learn is the exit code.
+        if (_adopt && sessionId != null)
+            try
+            {
+                using var adopt = Process.Start(new ProcessStartInfo("cmd.exe")
+                {
+                    ArgumentList = { "/c", _claude, "--desktop", "--resume", sessionId },
+                    WorkingDirectory = @"{{LISTENER_ROOT_WIN}}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                })!;
+                using var adoptCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                await adopt.WaitForExitAsync(adoptCts.Token);
+                _log?.Invoke($"Desktop adoption of session {sessionId}: exit {adopt.ExitCode}");
+            }
+            catch (Exception ex) { _log?.Invoke($"Desktop adoption of session {sessionId} failed: {ex.Message}"); }
 
         var line = result is { Length: > 0 } ? result : "I couldn't get a result for that task.";
         // The reply is written to be spoken, but an unattended model can still ramble: cut at a

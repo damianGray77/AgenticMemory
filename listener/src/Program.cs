@@ -705,7 +705,7 @@ var lastPrune = DateTime.Now;
 // the desktop app. See Worker.cs.
 var worker = config.WorkerEnabled
     ? new Worker(config.ClaudePath, config.WorkerModel, Path.Combine(Root, "worker-settings.json"),
-        config.WorkerTimeoutMinutes, Exec, s => responder?.AskAloud(s) ?? false, Log)
+        config.WorkerTimeoutMinutes, config.WorkerAdoptSessions, Exec, s => responder?.AskAloud(s) ?? false, Log)
     : null;
 
 // A spoken work request lands here instead of being attempted by voice: the row is the durable
@@ -890,6 +890,9 @@ sealed class Config
     public string WorkerModel { get; set; } = "sonnet";
     /// <summary>A task session that runs longer than this is killed and the task marked failed.</summary>
     public int WorkerTimeoutMinutes { get; set; } = 15;
+    /// <summary>Open each finished run in the Claude desktop app (claude --desktop --resume), so
+    /// every voice-created task session is visible there without asking.</summary>
+    public bool WorkerAdoptSessions { get; set; } = true;
 
     // ---- Addressee detector (the learned "was that said TO me?") ----
     /// <summary>The continually-learning no-wake-word detector (models\minilm + addressee-weights.json).</summary>
@@ -939,7 +942,7 @@ sealed class Config
     /// <summary>Kokoro v1.0 speaker id (the full 54-voice map prints in the harness/model log).
     /// Favorites: 3 af_heart, 10 af_sky, 16 am_michael, 24 bm_daniel, 25 bm_fable.</summary>
     public int TtsVoice { get; set; } = 3;
-    public float TtsSpeed { get; set; } = 1.0f;
+    public float TtsSpeed { get; set; } = 0.92f;
 
     /// <summary>Utterances that, standing alone, are almost always Whisper hallucinating on noise.</summary>
     public string[] HallucinationFilter { get; set; } =
