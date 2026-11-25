@@ -5,6 +5,14 @@
       "Bash(python -I:*)",
       "Bash(date:*)",
       "Read"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(del:*)",
+      "Bash(rmdir:*)",
+      "Bash(Remove-Item:*)",
+      "Bash(python -I -c:*)",
+      "Bash(python -I -:*)"
     ]
   }
 }
