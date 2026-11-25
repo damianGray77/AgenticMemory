@@ -79,8 +79,41 @@ and voice enrollment (step 4) are always manual.
   flip-flopping between named and `other`; `SpeakerSplit*` cuts a stretch where the voice changes
   mid-stretch.
 - The self-hearing protections (it leaves the mic open while speaking, for barge-in) are not
-  settings: while its TTS plays plus a 4 s echo tail, anything scoring close to its own voiceprint
-  is tagged `claude` and never answered.
+  settings: while its TTS plays plus a 4 s echo tail (counted from when the speech was heard, not
+  from when its transcription finished), anything scoring close to its own voiceprint is tagged
+  `claude` and never answered -- and so is anything that mostly repeats, word pairs in order, what
+  it said aloud in the last 30 s, whatever the voiceprint says.
+- `ReflectionAsks*`: when an open reflection thread turns on something only you can settle,
+  the reflection pass queues one spoken question in `reflection_asks`. The listener puts the oldest
+  waiting one at a quiet moment (20 s without speech, your voice heard in the last
+  `ReflectionAskPresenceMinutes`), at most one per `ReflectionAskGapHours`, and stores the first
+  reply as the row's `answer` for the next pass. Any question asked aloud, the noticer's included,
+  now reaches the voice brain together with the reply, so a short answer makes sense to it.
+- `DenoiseSpeech` / `DenoiseModel` / `DenoiseMix` (off by default): speech-only cleanup. A small
+  denoiser (sherpa-onnx GTCRN, `gtcrn_simple.onnx`, ~0.5 MB, from the sherpa-onnx
+  `speech-enhancement-models` release, into `models\gtcrn\`) runs on each clip the VAD called
+  speech, just before the speech model. The sound tagger and speaker ID still hear the raw room.
+  Measure before switching it on: on one machine (XLR mic, game and music on) a read passage
+  scored 5.9% word errors as heard, 10.3% half-denoised and 14.7% denoised, so it stays off there.
+- `HotwordsEnabled` / `Hotwords` / `HotwordScore` (off by default): decode-time biasing for
+  Parakeet. The decoder switches to beam search and gives each candidate reading a bonus for every
+  word piece of a hotword it follows, so a close call ("Claude" vs "Floyd") tips toward the hotword
+  while clear speech still decides. Nothing rewrites the text afterwards. sherpa-onnx needs a
+  sentencepiece vocabulary to spell the hotwords, which the Parakeet export lacks; the transcriber
+  builds a stand-in from `tokens.txt` in a temp file at load. On synthetic speech in white noise
+  (6 Kokoro voices), `Claude` at 1.0 cost nothing on clean audio and at 0 dB caught 20 of 24
+  wake words against 9 without it. Its false hits were mostly "Clyde", a near-homophone. At 1.5,
+  "clawed" started turning into Claude, and 3.0 turned plenty of words into it. On a real voice
+  (one machine, two `asr-test` readings) plain decoding already caught every Claude it heard
+  cleanly. At 1.0, "Clyde", "clawed" and "Claire" all became Claude, so it stays off there.
+  Synthetic noise flatters it; measure on your own voice before turning it on.
+- `Listener.exe asr-test [seconds]` measures the speech path. It shows a passage and records you
+  reading it from one Enter to the next, so no countdown or after-room gets in. `seconds` is only
+  the limit. The recording stays in memory, and the daemon is muted meanwhile. It reports the word
+  error rate as heard, with `Hotwords`, denoised, and half-and-half. It also reports how many of the
+  passage's five Claudes came through, how many turned up where none was said, and whether the
+  look-alikes (Pink Floyd, clouds, Clyde, clawed) stayed themselves. Run it after any mic, gain or
+  room change, and before switching `HotwordsEnabled` or `DenoiseSpeech` on.
 
 ## The task worker
 

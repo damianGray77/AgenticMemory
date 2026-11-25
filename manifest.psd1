@@ -88,5 +88,5 @@
     )
 
     # What a complete install contains, checked at the end of install.ps1.
-    Expect = @{ Tables = 31; FtsIndexes = 9; Views = 14; Procedures = 21 }
+    Expect = @{ Tables = 32; FtsIndexes = 9; Views = 14; Procedures = 21 }
 }

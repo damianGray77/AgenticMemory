@@ -64,13 +64,24 @@ public sealed class Transcriber
     /// piece per voice turn, so a fast back-and-forth (replies quicker than the pause threshold) isn't glued into one
     /// utterance under one name. Null = off.
     /// </param>
+    /// <param name="cleaner">
+    /// Speech-only cleanup: each clip is denoised right before the speech model reads it. onText still gets the clip as
+    /// heard (speaker ID was enrolled on uncleaned audio), and nothing upstream changes. Null = off.
+    /// </param>
+    /// <param name="hotwords">
+    /// Words (or phrases) the Parakeet decoder is biased toward while it decodes -- not a find-and-replace on its
+    /// output. Null or empty = plain greedy decoding. Whisper ignores these; it has the prompt.
+    /// </param>
+    /// <param name="hotwordScore">The bonus for each word piece of a hotword a decoding path follows.</param>
     public Transcriber(string modelPath, string vadModelPath, string prompt, Action<string, float[]> onText, Action<string>? log,
         double stretchSeconds, double pauseSeconds, bool liftQuietSpeech, bool keepSpeech = true, double flushSeconds = 0,
-        Func<float[], IReadOnlyList<(int Start, int End)>, int[]>? splitTurns = null, CancellationToken ct = default)
+        Func<float[], IReadOnlyList<(int Start, int End)>, int[]>? splitTurns = null, SpeechCleaner? cleaner = null,
+        IReadOnlyList<string>? hotwords = null, float hotwordScore = 1f, CancellationToken ct = default)
     {
         foreach (var path in new[] { modelPath, vadModelPath })
             if (!File.Exists(path) && !Directory.Exists(path)) throw new FileNotFoundException($"The speech model \"{path}\" isn't there.", path);
-        _work = Task.Run(() => RunAsync(modelPath, vadModelPath, prompt.Trim(), onText, log, stretchSeconds, pauseSeconds, liftQuietSpeech, keepSpeech, flushSeconds, splitTurns, ct), ct);
+        var hot = hotwords?.Select(w => w.Trim()).Where(w => w.Length > 0).ToArray() ?? [];
+        _work = Task.Run(() => RunAsync(modelPath, vadModelPath, prompt.Trim(), onText, log, stretchSeconds, pauseSeconds, liftQuietSpeech, keepSpeech, flushSeconds, splitTurns, cleaner, hot, hotwordScore, ct), ct);
     }
 
     /// <summary>
@@ -98,7 +109,8 @@ public sealed class Transcriber
 
     async Task<float[]> RunAsync(string modelPath, string vadModelPath, string prompt, Action<string, float[]> onText, Action<string>? log,
         double stretchSeconds, double pauseSeconds, bool liftQuietSpeech, bool keepSpeech, double flushSeconds,
-        Func<float[], IReadOnlyList<(int Start, int End)>, int[]>? splitTurns, CancellationToken ct)
+        Func<float[], IReadOnlyList<(int Start, int End)>, int[]>? splitTurns, SpeechCleaner? cleaner, string[] hotwords,
+        float hotwordScore, CancellationToken ct)
     {
         var clock = Stopwatch.StartNew();
         // Two speech engines behind one recognize() seam. A DIRECTORY is a sherpa-onnx NeMo
@@ -113,17 +125,19 @@ public sealed class Transcriber
         // Real speech passes on the first try; hard audio gets one honest attempt.
         await using var whisper = whisperFactory == null ? null : BuildWhisper();
         using var parakeet = whisperFactory != null ? null : BuildParakeet();
+        // Both engines read the clip through the cleaner when there is one: speech-only cleanup, the one
+        // place it can go without touching what the sound tagger or speaker ID hear.
         Func<float[], Task<string>> recognize = whisper != null
             ? async audio =>
             {
                 var text = new StringBuilder();
-                await foreach (var segment in whisper.ProcessAsync(audio, ct)) text.Append(segment.Text);
+                await foreach (var segment in whisper.ProcessAsync(cleaner?.Clean(audio) ?? audio, ct)) text.Append(segment.Text);
                 return text.ToString();
             }
             : audio => Task.Run(() =>
             {
                 using var stream = parakeet!.CreateStream();
-                stream.AcceptWaveform(SampleRate, audio);
+                stream.AcceptWaveform(SampleRate, cleaner?.Clean(audio) ?? audio);
                 parakeet.Decode(stream);
                 return stream.Result.Text;
             }, ct);
@@ -131,7 +145,10 @@ public sealed class Transcriber
         using var vad = vadFactory.CreateBuilder().WithMaxSpeechDuration(LongestSpeech).Build();
         log?.Invoke(whisper != null
             ? $"Loaded {Path.GetFileName(modelPath)} on {RuntimeOptions.LoadedLibrary} in {clock.Elapsed.TotalSeconds:0.0}s"
-            : $"Loaded {Path.GetFileName(modelPath)} (NeMo transducer, no hallucination by construction) in {clock.Elapsed.TotalSeconds:0.0}s");
+            : $"Loaded {Path.GetFileName(modelPath)} (NeMo transducer, no hallucination by construction" +
+              (hotwords.Length > 0 ? $"; beam search biased toward {string.Join(", ", hotwords)} at {hotwordScore:0.##}" : "") +
+              $") in {clock.Elapsed.TotalSeconds:0.0}s");
+        if (whisper != null && hotwords.Length > 0) log?.Invoke("Hotwords apply to Parakeet only; Whisper spells names from Prompt.");
         _loaded.SetResult();
 
         WhisperProcessor BuildWhisper()
@@ -152,7 +169,36 @@ public sealed class Transcriber
             config.ModelConfig.NumThreads = 2;   // same restraint as the other ONNX sessions: the ears must stay cheap
             config.ModelConfig.Provider = "cpu";
             config.DecodingMethod = "greedy_search";
-            return new OfflineRecognizer(config);
+            if (hotwords.Length == 0) return new OfflineRecognizer(config);
+            // Hotwords bias the decoding itself; nothing rewrites the text afterwards. Beam search keeps a
+            // few candidate readings alive and gives a reading a bonus for each word piece it follows of a
+            // hotword (taken back if it leaves the word partway), so a close call between "Claude" and
+            // "Floyd" tips toward Claude while clear speech still decides. sherpa-onnx spells each hotword
+            // with a sentencepiece vocabulary, which the Parakeet export doesn't ship: tokens.txt stands in,
+            // every piece at the same cost, so the fewest-piece spelling wins -- the one the model itself
+            // emits ("Claude" = _C l a ud e). Both files are read at construction, then deleted.
+            var vocab = Path.Combine(Path.GetTempPath(), $"listener-{Environment.ProcessId}-{Guid.NewGuid():N}.vocab");
+            var list = Path.ChangeExtension(vocab, ".hotwords");
+            try
+            {
+                File.WriteAllLines(vocab, File.ReadLines(config.ModelConfig.Tokens)
+                    .Select(line => line.LastIndexOf(' ') is var cut and > 0 ? line[..cut] : "")
+                    .Where(piece => piece.Length > 0 && piece is not ("<unk>" or "<blk>"))
+                    .Select(piece => piece + "\t-1"));
+                File.WriteAllLines(list, hotwords);
+                config.DecodingMethod = "modified_beam_search";
+                config.MaxActivePaths = 4;
+                config.HotwordsFile = list;
+                config.HotwordsScore = hotwordScore;
+                config.ModelConfig.ModelingUnit = "bpe";
+                config.ModelConfig.BpeVocab = vocab;
+                return new OfflineRecognizer(config);
+            }
+            finally
+            {
+                File.Delete(vocab);
+                File.Delete(list);
+            }
         }
 
         // Heard but not yet in a stretch: speech still going on, or the last moment of quiet.
@@ -315,4 +361,43 @@ public sealed class Transcriber
         }
 
     }
+}
+
+/// <summary>
+/// Speech-only cleanup: a small denoiser (sherpa-onnx GTCRN, ~0.5 MB) run on a clip the VAD already called speech, just
+/// before the speech model reads it. It is never run on the raw stream: the room's sound is sensory input the sound tagger
+/// hears as it is, and only what is being turned into words is cleaned. It strips non-voice sound under a voice (music,
+/// game effects, hum), not other voices. Mix blends it with the clip as heard (1 = all denoised), since denoiser artifacts
+/// can cost a speech model more words than the noise did: check with "Listener.exe asr-test" before switching it on.
+/// </summary>
+public sealed class SpeechCleaner : IDisposable
+{
+    readonly OfflineSpeechDenoiser _denoiser;
+    readonly float _mix;
+    readonly object _gate = new();
+
+    public SpeechCleaner(string modelPath, float mix)
+    {
+        if (!File.Exists(modelPath)) throw new FileNotFoundException($"The denoiser model \"{modelPath}\" isn't there.", modelPath);
+        var config = new OfflineSpeechDenoiserConfig();
+        config.Model.Gtcrn.Model = modelPath;
+        config.Model.NumThreads = 1;   // a tiny model; the ears must stay cheap
+        config.Model.Provider = "cpu";
+        _denoiser = new OfflineSpeechDenoiser(config);
+        _mix = Math.Clamp(mix, 0f, 1f);
+    }
+
+    public float[] Clean(float[] audio)
+    {
+        if (audio.Length == 0 || _mix == 0) return audio;
+        float[] denoised;
+        lock (_gate) denoised = _denoiser.Run(audio, Transcriber.SampleRate).Samples;
+        // The denoiser's frames can leave the output a few samples short: the clip as heard fills the tail.
+        var output = new float[audio.Length];
+        for (var i = 0; i < output.Length; i++)
+            output[i] = i < denoised.Length ? _mix * denoised[i] + (1 - _mix) * audio[i] : audio[i];
+        return output;
+    }
+
+    public void Dispose() => _denoiser.Dispose();
 }

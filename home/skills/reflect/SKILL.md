@@ -20,6 +20,7 @@ Database CLI (SQLite): `"{{MEMDB_POSIX}}" -e "<SQL>"`
 ## 1. Load the train of thought
 - **Last reflection:** `SELECT id, title, content, kind, created_at FROM reflections WHERE is_active = 1 ORDER BY id DESC LIMIT 3;`
 - **Open threads:** `SELECT t.id, t.question, t.nothing_new_count, p.slug AS project, t.updated_at FROM reflection_threads t LEFT JOIN projects p ON p.id = t.project_id WHERE t.status = 'open' ORDER BY t.updated_at;`
+- **Questions put to {{USER_NAME}} aloud:** `SELECT a.id, a.thread_id, a.question, a.asked_at, a.answer FROM reflection_asks a JOIN reflection_threads t ON t.id = a.thread_id WHERE t.status = 'open' OR a.answered_at > datetime(now(), '-7 days') ORDER BY a.id;` An answer is the best evidence a thread can get, {{USER_NAME}}'s own word (though transcribed): weigh it above anything inferred. When it is short or garbled, read the speech percepts from the few minutes after `asked_at`. Cite as `ask <id>`.
 
 ## 2. Load the raw material (lookback = `reflection_lookback_days`, default 7)
 - **Recent session notes:** `SELECT n.id, n.session_id, s.project_id, n.note_type, n.title, LEFT(n.content, 400) FROM session_notes n JOIN sessions s ON s.id = n.session_id WHERE n.created_at > datetime(now(), '-7 days') ORDER BY n.created_at;`
@@ -48,5 +49,7 @@ For each open thread, exactly one of:
 
 **Open new threads** only for questions that will still matter next week, and only while `COUNT(status='open') < reflection_max_open_threads` (default 5): `INSERT INTO reflection_threads (project_id, question, opened_reflection_id) VALUES (<pid or NULL>, '<question>', <reflection_id>);` If at the cap, the new question must displace a weaker one (retire it with a resolution saying so) or wait.
 
+**Ask {{USER_NAME}} aloud** when an open thread turns on something only {{USER_NAME}} can settle (a decision that is theirs, a fact only they know, what they meant), never on something the evidence will settle by itself. The listener speaks it at a quiet moment while {{USER_NAME}} is in the room, at most one every few hours, and records the first reply: `INSERT INTO reflection_asks (thread_id, question) VALUES (<thread id>, '<question>');` Write ONE natural spoken sentence, under ~25 words, answerable in a sentence, with no ids, table names or figures to look up ("Is gate four a fail, or do you want to re-mark it?"). At most one waiting (unasked) row per thread. Asked and unanswered: ask once more, reworded, no sooner than a week later; never chase. Rows of closed or retired threads are never spoken. A thread an answer closes cites it in `resolution` (`ask <id>`).
+
 ## 5. Report
-End with a short plain-text report: run id, reflection title (or "quiet"), threads advanced/closed/opened/retired, and anything that deserves {{USER_NAME}}'s eyes. The runner appends it to `{{REFLECTOR_ROOT_WIN}}\logs\`. Session boot prints the latest reflection and open threads, so write for tomorrow-morning-you reading it cold.
+End with a short plain-text report: run id, reflection title (or "quiet"), threads advanced/closed/opened/retired, questions queued to ask aloud, and anything that deserves {{USER_NAME}}'s eyes. The runner appends it to `{{REFLECTOR_ROOT_WIN}}\logs\`. Session boot prints the latest reflection and open threads, so write for tomorrow-morning-you reading it cold.

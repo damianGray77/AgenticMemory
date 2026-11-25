@@ -87,7 +87,9 @@ public sealed partial class Responder : IDisposable
         "code blocks, no stage directions.\n\n" +
         "You have read-only tools: memdb (SQLite CLI over the claude_memory database at " +
         "\"{{MEMDB_POSIX}}\" -e \"<SQL>\") with tables memories, session_notes, sessions, " +
-        "percepts (what you've heard in the room), reflections, reflection_threads, digest_lines; full-text " +
+        "percepts (what you've heard in the room), noticings (your own quiet observations of the room), " +
+        "reflections, reflection_threads, reflection_asks (questions you put to {{USER_NAME}} aloud, with the " +
+        "answers), digest_lines; full-text " +
         "search via <table>_fts with fts_any('words'). Use a lookup when the question needs one, keep it to a " +
         "couple of quick LIMITed queries, and never write to the database. The schema is at " +
         @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + " if you need it.\n\n" +
@@ -192,15 +194,21 @@ public sealed partial class Responder : IDisposable
     /// heard. Inferred address, so the answering model gets the [NOT_FOR_ME] escape hatch.</summary>
     public void RespondDirect(string query) => Launch(query.Trim(), selfJudge: true, query);
 
-    /// <summary>The day-mind's voice: a short clarifying question about something just noticed,
-    /// spoken aloud with the conversation window left open, so the answer is heard without a wake
-    /// word. {{USER_NAME}} invited these ("feel free to ask"); the caller keeps them rare. Returns false
+    /// <summary>The day-mind's voice: a short question -- about something just noticed, or one the
+    /// reflection pass is carrying -- spoken aloud with the conversation window left open, so the
+    /// answer is heard without a wake word. {{USER_NAME}} invited these ("feel free to ask"); the caller
+    /// keeps them rare. The question is remembered, so the reply that follows reaches the brain with
+    /// it (a bare "re-mark it" means nothing on its own) and is handed to onAnswer. Returns false
     /// without speaking when an exchange is running or a conversation is live -- curiosity never
     /// interrupts.</summary>
-    public bool AskAloud(string question)
+    public bool AskAloud(string question, Action<string>? onAnswer = null)
     {
         if (Engaged || !_oneAtATime.Wait(0)) return false;
-        try { Answered(question); }
+        try
+        {
+            Volatile.Write(ref _asked, new AskedAloud(question, DateTime.Now, onAnswer));
+            Answered(question);
+        }
         finally
         {
             _oneAtATime.Release();
@@ -210,6 +218,9 @@ public sealed partial class Responder : IDisposable
     }
 
     string? _held;   // speech that arrived mid-exchange: answered next, not dropped
+
+    sealed record AskedAloud(string Question, DateTime At, Action<string>? OnAnswer);
+    AskedAloud? _asked;   // the last question put to {{USER_NAME}} aloud, until the next query takes it
 
     void Launch(string query, bool selfJudge, string utterance)
     {
@@ -252,8 +263,18 @@ public sealed partial class Responder : IDisposable
         // rides along only when the conversation has been quiet a while (or on inferred address).
         var stale = (DateTime.Now - _lastAsked).TotalMinutes > 5;
         _lastAsked = DateTime.Now;
+        // The first query after a question asked aloud is most likely its answer: say what was asked.
+        // Only while fresh -- the conversation window, plus slack for a wake-worded late reply.
+        var asked = Volatile.Read(ref _asked);
+        if (asked != null && (DateTime.Now - asked.At).TotalSeconds > _conversationSeconds + 90)
+        {
+            Interlocked.CompareExchange(ref _asked, null, asked);
+            asked = null;
+        }
         var message =
             (selfJudge ? "(picked up with NO wake word -- may not be addressed to you)\n" : "") +
+            (asked != null ? $"(Just before this you asked {{USER_NAME}} aloud: \"{asked.Question}\" -- this is " +
+                             "probably the answer. Take it as one and acknowledge it in a sentence.)\n" : "") +
             (stale || selfJudge ? "Recent room context (rough transcription):\n" + _context() + "\n\n" : "") +
             $"{{USER_NAME}} said: \"{query}\"";
 
@@ -262,6 +283,10 @@ public sealed partial class Responder : IDisposable
         var stream = new SpokenStream(this);
         var reply = await _brain.AskAsync(message, TimeSpan.FromSeconds(60), stream.OnText);
         await stream.FinishAsync();
+        // Taken only by a reply the brain accepts: an overheard line (or Claude's own echo) declined
+        // with [NOT_FOR_ME] leaves the question waiting for the real answer.
+        if (asked != null && !stream.NotForMe && Interlocked.CompareExchange(ref _asked, null, asked) == asked)
+            asked.OnAnswer?.Invoke(query);
 
         if (stream.NotForMe)
         {
@@ -421,8 +446,36 @@ public sealed partial class Responder : IDisposable
         catch { return false; }
     }
 
+    // What Claude said aloud lately, as word pairs, so the ears can tell its own voice coming back
+    // through the mic by its WORDS when the voiceprint can't: through room speakers it has scored
+    // closer to {{USER_NAME}} (0.83, 0.91) than to itself, and a long reply finishes transcribing after
+    // the echo window has closed.
+    readonly Queue<(HashSet<string> Pairs, DateTime At)> _said = new();
+
+    static string[] Words(string text) =>
+        Regex.Matches(text.ToLowerInvariant(), "[a-z0-9']+").Select(m => m.Value).ToArray();
+
+    static IEnumerable<string> Pairs(string[] words) =>
+        Enumerable.Range(0, Math.Max(0, words.Length - 1)).Select(i => words[i] + " " + words[i + 1]);
+
+    /// <summary>True when a transcribed utterance is mostly what Claude itself said aloud in the last
+    /// 30 s, word pairs in order -- an echo, whatever the voiceprint says. Pairs, not bare words, so
+    /// a reply that reuses the question's words ("no, it is not a fail") still counts as a person.</summary>
+    public bool IsEcho(string heard)
+    {
+        var pairs = Pairs(Words(heard)).ToArray();
+        if (pairs.Length < 3) return false;   // too short to tell from a real reply
+        lock (_said)
+        {
+            while (_said.Count > 0 && (DateTime.Now - _said.Peek().At).TotalSeconds > 30) _said.Dequeue();
+            if (_said.Count == 0) return false;
+            return pairs.Count(p => _said.Any(s => s.Pairs.Contains(p))) >= 0.6 * pairs.Length;
+        }
+    }
+
     void PlayChunk(string? wav, string text)
     {
+        lock (_said) _said.Enqueue((Pairs(Words(text)).ToHashSet(), DateTime.Now));
         try
         {
             _log?.Invoke($"Speaking ({(wav != null ? "Kokoro" : "SAPI")}): {text}");

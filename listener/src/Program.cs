@@ -46,6 +46,156 @@ if (args.Length >= 1 && args[0].Equals("enroll-tts", StringComparison.OrdinalIgn
     return;
 }
 
+// "Listener.exe asr-test [seconds]" scores the speech path on a read-aloud passage: it records the reading
+// (in memory only -- raw audio never touches disk), then runs that SAME recording through the live
+// transcriber several ways -- as heard, with Hotwords, denoised, and half-and-half -- and reports each one's
+// word error rate against the passage, how often each hotword came through (and turned up where it wasn't
+// said), and whether the passage's look-alike words stayed themselves. Use it before switching
+// HotwordsEnabled or DenoiseSpeech on, and after any mic or room change. The daemon is muted while you read,
+// so the reading stays out of percepts.
+if (args.Length >= 1 && args[0].Equals("asr-test", StringComparison.OrdinalIgnoreCase))
+{
+    await AsrTest(args.Length > 1 && int.TryParse(args[1], out var testSeconds) ? testSeconds : 50);
+    return;
+}
+
+async Task AsrTest(int seconds)
+{
+    // Five Claudes to catch, and four look-alikes that must stay themselves.
+    const string passage =
+        "Claude, this is a second reading test for the listener. Claude, the game is still running in the background, and " +
+        "earlier I had some Pink Floyd playing. Claude, I want to know how many words come through clearly. The " +
+        "clouds outside look heavy, and my friend Clyde says the cat clawed the couch again. Okay Claude, gate four " +
+        "was not a failure, so leave it as it is. Hey Claude, please write down exactly what you hear, word for word.";
+    string[] lookAlikes = ["floyd", "clouds", "clyde", "clawed"];
+    var hotwords = config.Hotwords.Select(w => w.Trim()).Where(w => w.Length > 0).ToArray();
+    var denoiserPath = Path.Combine(Root, "models", config.DenoiseModel);
+    Console.WriteLine("Read this aloud at your usual distance and volume, with the room as it usually is:");
+    Console.WriteLine();
+    var line = new System.Text.StringBuilder("  ");
+    foreach (var word in passage.Split(' '))
+    {
+        if (line.Length + word.Length > 92) { Console.WriteLine(line.ToString()); line.Clear().Append("  "); }
+        line.Append(word).Append(' ');
+    }
+    Console.WriteLine(line.ToString());
+    Console.WriteLine();
+    // Recording runs from one Enter to the next, so neither a countdown (people start reading at the
+    // first Enter) nor the room after the last word (a game's dialogue scored as extra words) gets in.
+    var interactive = !Console.IsInputRedirected;
+    if (interactive) { Console.Write("Press Enter, then start reading. "); Console.ReadLine(); }
+    var hadMute = File.Exists(mutePath);
+    if (!hadMute) File.Create(mutePath).Dispose();   // keep the reading out of percepts
+    float[] recording;
+    try
+    {
+        var samples = new List<float>();
+        using (var mic = await Microphone.StartAsync(config.Microphone, s => { lock (samples) samples.AddRange(s); }))
+        {
+            Console.WriteLine(interactive
+                ? $"RECORDING -- read now, and press Enter as soon as you finish (it stops by itself after {seconds}s)."
+                : $"RECORDING for {seconds}s -- read now.");
+            var limit = Task.Delay(TimeSpan.FromSeconds(seconds));
+            await (interactive ? Task.WhenAny(Task.Run(Console.ReadLine), limit) : limit);
+        }
+        lock (samples) recording = samples.ToArray();
+    }
+    finally { if (!hadMute && File.Exists(mutePath)) File.Delete(mutePath); }
+    using var denoised = File.Exists(denoiserPath) ? new SpeechCleaner(denoiserPath, 1f) : null;
+    using var blended = File.Exists(denoiserPath) ? new SpeechCleaner(denoiserPath, 0.5f) : null;
+    var runs = new List<(string Label, SpeechCleaner? Cleaner, string[]? Hotwords)> { ("As heard, no hotwords", null, null) };
+    if (hotwords.Length > 0) runs.Add(($"Hotwords ({string.Join(", ", hotwords)} at {config.HotwordScore:0.##})", null, hotwords));
+    if (denoised != null) { runs.Add(("Denoised", denoised, null)); runs.Add(("Half-and-half", blended, null)); }
+    Console.WriteLine($"Done: {recording.Length / (double)Transcriber.SampleRate:0.0}s captured. Transcribing it {runs.Count} ways...");
+    var said = ScoreWords(passage);
+    var watched = hotwords.SelectMany(ScoreWords).Distinct().Where(said.Contains).ToArray();
+    foreach (var run in runs)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var text = await TranscribeOnce(recording, run.Cleaner, run.Hotwords);
+        var (errors, words) = WordErrors(passage, text);
+        var notes = watched.Select(w =>
+            {
+                var t = WordTally(passage, text, w);
+                return $"\"{w}\" {t.Heard} of {t.Said} heard" + (t.Invented > 0 ? $", {t.Invented} where it wasn't said" : "");
+            })
+            .Append($"look-alikes kept {lookAlikes.Sum(w => WordTally(passage, text, w).Heard)} of " +
+                    $"{lookAlikes.Sum(w => WordTally(passage, text, w).Said)} ({string.Join(", ", lookAlikes)})");
+        Console.WriteLine();
+        Console.WriteLine($"{run.Label}: {errors} of {words} words wrong (WER {100.0 * errors / words:0.0}%), {clock.Elapsed.TotalSeconds:0.0}s");
+        Console.WriteLine($"  {string.Join("; ", notes)}");
+        Console.WriteLine($"  {text}");
+    }
+}
+
+// The live transcriber, fed a recording in the microphone's 10 ms packets (it lifts quiet speech in
+// place, so each run gets fresh copies), with or without speech cleanup and hotwords.
+async Task<string> TranscribeOnce(float[] recording, SpeechCleaner? cleaner, string[]? hotwords = null)
+{
+    var parts = new List<string>();
+    var transcriber = new Transcriber(Path.Combine(Root, "models", config.Model), Path.Combine(Root, "models", Transcriber.VadModel),
+        config.Prompt, (text, _) => { lock (parts) parts.Add(text.Trim()); }, null,
+        config.StretchSeconds, config.PauseMilliseconds / 1000.0, liftQuietSpeech: true, keepSpeech: false, cleaner: cleaner,
+        hotwords: hotwords, hotwordScore: config.HotwordScore);
+    await transcriber.Ready;
+    for (var at = 0; at < recording.Length; at += Transcriber.SampleRate / 100)
+        transcriber.Add(recording[at..Math.Min(at + Transcriber.SampleRate / 100, recording.Length)]);
+    await transcriber.CompleteAsync();
+    lock (parts) return string.Join(" ", parts);
+}
+
+// The words a transcript is scored on: case, punctuation and apostrophes are ignored, and single digits
+// count as their words ("4" = "four").
+static string[] ScoreWords(string s)
+{
+    string[] digits = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+    return System.Text.RegularExpressions.Regex.Matches(s.ToLowerInvariant(), "[a-z0-9']+")
+        .Select(m => m.Value.Replace("'", ""))
+        .Select(w => w.Length == 1 && char.IsDigit(w[0]) ? digits[w[0] - '0'] : w).ToArray();
+}
+
+// Word error rate's numerator and denominator: the fewest substitutions, deletions and insertions that
+// turn the transcript into the passage, over the passage's word count.
+static (int Errors, int Words) WordErrors(string reference, string hypothesis)
+{
+    var r = ScoreWords(reference);
+    var h = ScoreWords(hypothesis);
+    var row = Enumerable.Range(0, h.Length + 1).ToArray();
+    for (var i = 1; i <= r.Length; i++)
+    {
+        var next = new int[h.Length + 1];
+        next[0] = i;
+        for (var j = 1; j <= h.Length; j++)
+            next[j] = Math.Min(Math.Min(row[j] + 1, next[j - 1] + 1), row[j - 1] + (r[i - 1] == h[j - 1] ? 0 : 1));
+        row = next;
+    }
+    return (row[h.Length], Math.Max(1, r.Length));
+}
+
+// How one word fared, on that same alignment: how many times the passage says it, how many of those came
+// through as it, and how many times the transcript has it where the passage has something else (or nothing).
+static (int Said, int Heard, int Invented) WordTally(string reference, string hypothesis, string word)
+{
+    var r = ScoreWords(reference);
+    var h = ScoreWords(hypothesis);
+    var d = new int[r.Length + 1, h.Length + 1];
+    for (var i = 0; i <= r.Length; i++) d[i, 0] = i;
+    for (var j = 0; j <= h.Length; j++) d[0, j] = j;
+    for (var i = 1; i <= r.Length; i++)
+        for (var j = 1; j <= h.Length; j++)
+            d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + (r[i - 1] == h[j - 1] ? 0 : 1));
+    int heard = 0, invented = 0;
+    for (int i = r.Length, j = h.Length; i > 0 || j > 0;)
+        if (i > 0 && j > 0 && d[i, j] == d[i - 1, j - 1] + (r[i - 1] == h[j - 1] ? 0 : 1))
+        {
+            if (h[j - 1] == word) { if (r[i - 1] == word) heard++; else invented++; }
+            i--; j--;
+        }
+        else if (j > 0 && d[i, j] == d[i, j - 1] + 1) { if (h[j - 1] == word) invented++; j--; }
+        else i--;
+    return (r.Count(w => w == word), heard, invented);
+}
+
 async Task EnrollTts(string name, string variant = "")
 {
     var dir = Path.Combine(Root, "models", "kokoro");
@@ -243,6 +393,19 @@ var lastSpokeAt = DateTime.MinValue;     // when the TTS last fell silent -- ech
 // The noticer's held questions, asked at the next quiet moment rather than dropped ({{USER_NAME}}: "you
 // could just postpone asking until a quiet period"). Guarded by itself.
 var pendingAsks = new Queue<(string Question, DateTime At)>();
+var lastOwnerAt = DateTime.MinValue;     // when {{USER_NAME}}'s own voice was last heard: someone to ask
+var lastReflectionAskCheck = DateTime.MinValue;
+
+object? Scalar(string sql, params (string Name, object Value)[] args)
+{
+    lock (dbGate)
+    {
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = sql;
+        foreach (var (name, value) in args) cmd.Parameters.AddWithValue(name, value);
+        return cmd.ExecuteScalar();
+    }
+}
 
 // INSERT and its last_insert_rowid under ONE lock -- split across two, a concurrent insert
 // from another thread would hand back the wrong id.
@@ -329,8 +492,15 @@ void Heard(string text, float[] speech)
     // nearly as claude-like as the winner IS claude. A real barge-in survives, because a human
     // voice scores high on its own profile and low on claude's, missing the margin.
     var selfBias = false;
-    var selfTalk = Volatile.Read(ref speaking) || (DateTime.Now - lastSpokeAt).TotalSeconds < 4;
-    if (selfTalk && speaker is not (null or "claude") && print != null && speakerId != null)
+    // The echo tail counts from when this speech was HEARD, not from when its transcription finished:
+    // a 6 s utterance can finish transcribing 4+ s after its last sound, so the window has to reach
+    // back at least its own length (measured: Claude's own 6.3 s question came back as {{USER_NAME_LOWER}} 0.83).
+    var heardFor = speech.Length / (double)Transcriber.SampleRate;
+    var selfTalk = Volatile.Read(ref speaking) || (DateTime.Now - lastSpokeAt).TotalSeconds < 4 + heardFor;
+    // Claude's own words coming back through the mic are Claude, whatever the voiceprint says.
+    var echo = speaker != "claude" && responder?.IsEcho(text) == true;
+    if (echo) speaker = "claude";
+    if (!echo && selfTalk && speaker is not (null or "claude") && print != null && speakerId != null)
     {
         var self = speakerId.ScoreFor("claude", print);
         if (self >= score - 0.08f && self >= 0.55f) { speaker = "claude"; score = self; selfBias = true; }
@@ -366,7 +536,8 @@ void Heard(string text, float[] speech)
     var perceptId = Insert("INSERT INTO percepts (kind, heard_at, content, source, created_at, speaker) VALUES ('speech', @at, @text, 'listener', @at, @speaker)",
         ("@at", now), ("@text", text), ("@speaker", (object?)speaker ?? DBNull.Value));
     lastHeardAt = DateTime.Now;   // any voice, Claude's own included: the room is not quiet
-    Log($"Heard {text.Length} chars{(speaker != null ? $" [{speaker} {score:0.00}{(stuck ? " stick" : selfBias ? " self" : "")}]" : "")}");
+    if (speaker == "{{USER_NAME_LOWER}}") lastOwnerAt = DateTime.Now;
+    Log($"Heard {text.Length} chars{(speaker != null ? $" [{speaker} {score:0.00}{(stuck ? " stick" : selfBias ? " self" : echo ? " echo" : "")}]" : "")}");
     // Claude's own voice, heard through the open mic while it speaks: an honest percept (what was
     // said aloud is part of the record), but never an addressee judgment and never answered.
     if (speaker == "claude") return;
@@ -560,6 +731,51 @@ void AskWhenQuiet()
     Log($"Asked aloud: {head.Question}");
     lock (pendingAsks)
         if (pendingAsks.Count > 0 && pendingAsks.Peek().Equals(head)) pendingAsks.Dequeue();
+}
+
+// The reflection pass's questions (reflection_asks): when an open thread turns on something only
+// {{USER_NAME}} can settle, the pass queues one spoken sentence. Put the oldest waiting one to
+// {{USER_NAME}} now and then -- a real lull, {{USER_NAME}} heard lately (someone is there to answer), no
+// conversation running, no fresher noticer question waiting -- and record the first reply on the row
+// for the next pass. Paced by the newest asked_at in the database, so a restart never re-fires it.
+void AskReflectionWhenQuiet()
+{
+    if (responder == null || !config.ReflectionAsksEnabled) return;
+    // Every 10s, not every minute: with music on, lulls are short, and a once-a-minute look kept
+    // landing before the lull was long enough.
+    if ((DateTime.Now - lastReflectionAskCheck).TotalSeconds < 10) return;
+    lastReflectionAskCheck = DateTime.Now;
+    if (File.Exists(mutePath) || Volatile.Read(ref speaking) || responder.Engaged) return;
+    lock (pendingAsks) if (pendingAsks.Count > 0) return;                    // the moment's question first
+    if ((DateTime.Now - lastHeardAt).TotalSeconds < 20) return;              // a real lull, not a breath
+    if ((DateTime.Now - lastOwnerAt).TotalMinutes > config.ReflectionAskPresenceMinutes) return;
+    var since = DateTime.Now.AddHours(-config.ReflectionAskGapHours).ToString("yyyy-MM-dd HH:mm:ss");
+    if (Convert.ToInt64(Scalar("SELECT COUNT(*) FROM reflection_asks WHERE asked_at > @since", ("@since", since))) > 0) return;
+    long id;
+    string question;
+    lock (dbGate)
+    {
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "SELECT a.id, a.question FROM reflection_asks a JOIN reflection_threads t ON t.id = a.thread_id " +
+                          "WHERE a.asked_at IS NULL AND t.status = 'open' AND TRIM(a.question) <> '' ORDER BY a.id LIMIT 1";
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return;
+        (id, question) = (reader.GetInt64(0), reader.GetString(1).Trim());
+    }
+    var askedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+    if (!responder.AskAloud(question, answer =>
+        {
+            try
+            {
+                Exec("UPDATE reflection_asks SET answer = @answer, answered_at = @at WHERE id = @id AND answer IS NULL",
+                    ("@answer", answer), ("@at", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")), ("@id", id));
+                Log($"Reflection ask {id} answered: {answer}");
+            }
+            catch (Exception ex) { Log($"Recording the answer to reflection ask {id} failed: {ex.Message}"); }
+        }))
+        return;   // an exchange slipped in; the next check retries
+    Exec("UPDATE reflection_asks SET asked_at = @at WHERE id = @id", ("@at", askedAt), ("@id", id));
+    Log($"Asked aloud (reflection ask {id}): {question}");
 }
 
 async Task NoticeAsync(long from, long to, float score)
@@ -779,6 +995,8 @@ if (config.NoticingEnabled)
         NoticerInstructions, Log);
     Log($"Noticing: threshold {config.NoticeThreshold:0.0}, min gap {config.NoticeMinMinutes:0} min, model {config.NoticerModel}.");
 }
+if (config.ReflectionAsksEnabled && responder != null)
+    Log($"Reflection asks: at most one per {config.ReflectionAskGapHours:0.#}h, when {{USER_NAME}} was heard in the last {config.ReflectionAskPresenceMinutes:0} min.");
 
 using var tagger = config.EnableSoundTags
     ? new SoundTagger(
@@ -786,6 +1004,18 @@ using var tagger = config.EnableSoundTags
         Path.Combine(Root, "models", "yamnet", "yamnet_class_map.csv"),
         config.SoundIgnore, config.SoundThreshold, config.SoundHoldSeconds, Scene, Log)
     : null;
+
+// Speech-only cleanup (DenoiseSpeech): each clip the VAD calls speech is denoised just before the
+// speech model reads it. The sound tagger and speaker ID keep the raw room -- its noise is sensory
+// input ({{USER_NAME}}'s call); only what is being turned into words is cleaned.
+SpeechCleaner? cleaner = null;
+if (config.DenoiseSpeech)
+    try
+    {
+        cleaner = new SpeechCleaner(Path.Combine(Root, "models", config.DenoiseModel), config.DenoiseMix);
+        Log($"Speech cleanup: {config.DenoiseModel} (mix {config.DenoiseMix:0.##}) on speech clips only; sound and speaker ID hear the raw room.");
+    }
+    catch (Exception ex) { Log($"Speech cleanup unavailable, transcribing as heard: {ex.Message}"); }
 
 while (true)
 {
@@ -797,7 +1027,8 @@ while (true)
             Path.Combine(Root, "models", Transcriber.VadModel),
             config.Prompt, Heard, Log,
             config.StretchSeconds, config.PauseMilliseconds / 1000.0,
-            liftQuietSpeech: true, keepSpeech: false, config.FlushSeconds, SplitTurns, cancel.Token);
+            liftQuietSpeech: true, keepSpeech: false, config.FlushSeconds, SplitTurns, cleaner,
+            config.HotwordsEnabled ? config.Hotwords : null, config.HotwordScore, cancel.Token);
         await transcriber.Ready;
 
         using var microphone = await Microphone.StartAsync(config.Microphone, samples =>
@@ -825,6 +1056,7 @@ while (true)
             if (DateTime.Now - lastPrune > TimeSpan.FromHours(24)) { Prune(); lastPrune = DateTime.Now; }
             try { SweepPending(); } catch (Exception ex) { Log($"Pending sweep failed: {ex.Message}"); }
             try { AskWhenQuiet(); } catch (Exception ex) { Log($"Pending ask failed: {ex.Message}"); }
+            try { AskReflectionWhenQuiet(); } catch (Exception ex) { Log($"Reflection ask failed: {ex.Message}"); }
             // Hot-reload the TTS voice when listener.json changes, so voices can be auditioned live.
             try
             {
@@ -858,6 +1090,22 @@ sealed class Config
     public string Model { get; set; } = "ggml-large-v3-turbo-q5_0.bin";
     /// <summary>Microphone device ID (empty = Windows default).</summary>
     public string Microphone { get; set; } = "";
+    /// <summary>Speech-only cleanup: denoise each speech clip just before the speech model (never the raw
+    /// stream the sound tagger hears). Off until "Listener.exe asr-test" shows it helps on this mic and room.</summary>
+    public bool DenoiseSpeech { get; set; } = false;
+    /// <summary>The denoiser model under models\ (sherpa-onnx GTCRN).</summary>
+    public string DenoiseModel { get; set; } = "gtcrn/gtcrn_simple.onnx";
+    /// <summary>How much of the denoised clip the speech model hears, 0-1 (the rest is the clip as heard).</summary>
+    public float DenoiseMix { get; set; } = 1f;
+    /// <summary>Bias the Parakeet decoder toward Hotwords while it decodes (beam search with a bonus for each
+    /// word piece of one), so a close call like "Claude"/"Floyd" tips toward the hotword while clear speech still
+    /// decides. Nothing rewrites the text afterwards. Off until "Listener.exe asr-test" shows it helps here.</summary>
+    public bool HotwordsEnabled { get; set; } = false;
+    /// <summary>Words or short phrases to bias toward, one per entry (Parakeet only; Whisper has Prompt).</summary>
+    public string[] Hotwords { get; set; } = ["Claude"];
+    /// <summary>The bonus for each word piece of a hotword. On synthetic speech in noise, 1.0 was nearly free
+    /// (only "Clyde" sometimes became Claude); 1.5 started on "clawed", and 3.0 turned plenty of words into it.</summary>
+    public float HotwordScore { get; set; } = 1.0f;
     /// <summary>Names and jargon Whisper should expect, so they're spelled right.</summary>
     public string Prompt { get; set; } = "{{USER_NAME}}, Claude";   // names/jargon to spell right; put yours in listener.json
     /// <summary>Speech that builds up before it's transcribed. Longer = cheaper, later.</summary>
@@ -915,6 +1163,12 @@ sealed class Config
     /// <summary>A held question older than this is let go instead of asked cold. There is no rate
     /// limit on asking ({{USER_NAME}}'s call); the salience gate's min-gap already paces question birth.</summary>
     public double NoticeAskStaleMinutes { get; set; } = 40;
+    /// <summary>Speak the reflection pass's questions (reflection_asks) at quiet moments.</summary>
+    public bool ReflectionAsksEnabled { get; set; } = true;
+    /// <summary>At most one reflection question per this many hours ({{USER_NAME}}: "sporadically").</summary>
+    public double ReflectionAskGapHours { get; set; } = 3;
+    /// <summary>Ask only when {{USER_NAME}}'s own voice was heard within this many minutes: someone to answer.</summary>
+    public double ReflectionAskPresenceMinutes { get; set; } = 10;
 
     // ---- Speaker ID (who is talking; models\<SpeakerModel> + voices\*.json profiles) ----
     public bool SpeakerIdEnabled { get; set; } = true;

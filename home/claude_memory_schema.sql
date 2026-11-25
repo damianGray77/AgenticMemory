@@ -607,6 +607,25 @@ WHEN NEW.updated_at IS OLD.updated_at AND (
   OR NEW.closed_reflection_id IS NOT OLD.closed_reflection_id)
 BEGIN UPDATE reflection_threads SET updated_at = now() WHERE id = NEW.id; END;
 
+-- Questions the reflection pass wants {{USER_NAME}} to answer out loud. A pass adds a row when an
+-- open thread turns on something only {{USER_NAME}} can settle (a decision that is theirs, a fact only
+-- they know). The listener ({{LISTENER_ROOT_WIN}}, AskReflectionWhenQuiet) speaks the oldest waiting
+-- row of an open thread at a quiet moment while {{USER_NAME}} is around, at most one per
+-- ReflectionAskGapHours, stamps asked_at, and records the first reply it hears as answer; the next
+-- pass reads that as evidence for the thread. A table of its own rather than columns on
+-- reflection_threads: install.ps1 only creates missing tables (it never adds columns), and that
+-- table's touch trigger calls now(), a memdb-only function the listener's own connection lacks.
+CREATE TABLE IF NOT EXISTS reflection_asks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id   INTEGER NOT NULL REFERENCES reflection_threads (id) ON DELETE CASCADE,
+  question    TEXT    NOT NULL CHECK (length(question) <= 300),   -- one natural spoken sentence
+  asked_at    TEXT,                                -- when the listener spoke it (NULL = waiting)
+  answer      TEXT,                                -- the first reply heard after it, as transcribed
+  answered_at TEXT,
+  created_at  TEXT    NOT NULL DEFAULT (now())
+);
+CREATE INDEX IF NOT EXISTS ix_reflection_asks_waiting ON reflection_asks (asked_at, thread_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS reflections_fts USING fts5(title, content, content='reflections', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER IF NOT EXISTS reflections_fts_ai AFTER INSERT ON reflections BEGIN
   INSERT INTO reflections_fts (rowid, title, content) VALUES (NEW.id, NEW.title, NEW.content); END;
