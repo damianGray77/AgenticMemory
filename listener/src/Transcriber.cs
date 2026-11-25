@@ -253,8 +253,11 @@ public sealed class Transcriber
                 eagerAudio = stretch.ToArray();
                 eager = recognize(eagerAudio);
             }
+            // The idle flush waits while speech is going on again: a speaker who stops to collect their
+            // thoughts and carries on is still mid-utterance, and flushing then cut one sentence into two
+            // percepts (the second often judged not-for-Claude and dropped). The stretch cap still bounds it.
             if (stretch.Count >= stretchSeconds * SampleRate ||
-                (flushSeconds > 0 && stretch.Count > 0 && (clock.Elapsed - stretchGrewAt).TotalSeconds > flushSeconds))
+                (flushSeconds > 0 && !speechGoing && stretch.Count > 0 && (clock.Elapsed - stretchGrewAt).TotalSeconds > flushSeconds))
                 await TranscribeAsync();
         }
         TakeSpeech(all: true);
