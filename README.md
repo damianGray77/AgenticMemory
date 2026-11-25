@@ -82,6 +82,7 @@ compatibility helpers (`LEFT`, `LOCATE`, `DATE_FORMAT`, `TIMESTAMPDIFF`, `REGEXP
 | `home/skills/memory/` | `~/.claude/skills/memory/` | `/memory` skill + `mem.ps1`, the only write path |
 | `home/skills/recall/` | `~/.claude/skills/recall/` | `/recall` skill |
 | `home/skills/consolidate-memory-db/` | `~/.claude/skills/consolidate-memory-db/` | The consolidation pass |
+| `home/skills/dwell/` | `~/.claude/skills/dwell/` | `/dwell` skill: one unhurried moment of idle time, run as `/loop /dwell` in a session of its own |
 | `consolidator-runner/` | `C:\Tools\consolidator\` | Headless runner for the scheduled task + its scoped permissions |
 | `db/seed.sql` | the database | Reference queries, consolidation config, evidence weight scale |
 | `install.ps1` | | Builds memdb, renders the templates, creates the database, wires the hooks |

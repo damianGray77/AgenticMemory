@@ -24,6 +24,7 @@
         'skills\recall\SKILL.md'
         'skills\consolidate-memory-db\SKILL.md'
         'skills\reflect\SKILL.md'
+        'skills\dwell\SKILL.md'
     )
 
     # Relative to the consolidation runner folder (C:\Tools\consolidator by default).
