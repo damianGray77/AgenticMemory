@@ -6,7 +6,7 @@ namespace Listener;
 /// <summary>
 /// The hands behind a [TASK] hand-off. Each queued voice task gets its own one-shot headless
 /// Claude session (claude -p in auto permission mode with prompts auto-denied: it reads, queries
-/// and uses the todo skills on its own, and anything that would need {{USER_NAME}}'s approval is refused
+/// and runs skills on its own, and anything that would need {{USER_NAME}}'s approval is refused
 /// rather than left hanging). The run claims the voice_tasks row, saves the result and session id
 /// on it, and speaks a short summary at the next quiet moment. Every run is a real resumable
 /// transcript: `claude --desktop --resume &lt;session id&gt;` pulls it into the desktop app.
@@ -21,11 +21,13 @@ public sealed class Worker
     readonly Action<string, (string Name, object Value)[]> _exec;
     readonly Func<string, bool> _speak;              // Responder.AskAloud: false while the room is mid-conversation
     readonly Action<string>? _log;
+    readonly string _localTools;                     // listener.json WorkerTools: skills only this machine has
     readonly SemaphoreSlim _oneAtATime = new(1, 1);  // serial: two unattended workers racing helps nobody
 
-    public Worker(string claudePath, string model, string settingsPath, int timeoutMinutes, bool adopt,
+    public Worker(string claudePath, string model, string settingsPath, int timeoutMinutes, bool adopt, string localTools,
         Action<string, (string Name, object Value)[]> exec, Func<string, bool> speak, Action<string>? log)
     {
+        _localTools = localTools;
         _claude = claudePath;
         _model = model;
         _settings = settingsPath;
@@ -80,15 +82,12 @@ public sealed class Worker
             "session on his work machine. The spoken request, restated by the voice assistant:\n\n" +
             $"\"{request}\"\n\n" +
             "Do the work now. Ground rules:\n" +
-            "- Tools you are set up for: the todo skills (/todo, /todo-task, /todo-recent) for {{USER_NAME}}'s EmailTodo " +
-            "task list; /todo-handoff to start Claude working on one of those tasks -- when he asks to hand off, " +
-            "delegate, start on or spin up a session for a task from his list, find it and run /todo-handoff: it " +
-            "starts its own auto-mode session in the task's folder, so do not attempt the task's work yourself, and " +
-            "if it says several tasks match, ask him which by naming them briefly; read-only SQL over the claude_memory database " +
+            "- Tools you are set up for: read-only SQL over the claude_memory database " +
             "(\"{{MEMDB_POSIX}}\" -e \"<SQL>\", schema at " +
             @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + "); reading files; and session notes through the " +
             "memory skill's mem.ps1. Write to the database no other way, and never touch the voice_tasks table " +
             "-- the listener owns your task's row.\n" +
+            (string.IsNullOrWhiteSpace(_localTools) ? "" : "- " + _localTools.Trim() + "\n") +
             "- You run unattended in auto permission mode: anything needing interactive approval is denied " +
             "automatically. If a denial blocks the heart of the task, stop and say plainly what needs {{USER_NAME}}.\n" +
             "- Never act on production systems, send anything externally, or push to remotes.\n" +

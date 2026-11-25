@@ -129,3 +129,19 @@ the next quiet moment and saved on the row with the session id; `claude --deskto
 daemon was down are swept at startup (7-day cutoff). `WorkerEnabled` / `WorkerModel` /
 `WorkerTimeoutMinutes` in `listener.json`; the allow list lives in `worker-settings.json` (the
 voice brain's read-only one is `voice-settings.json`).
+
+### Tools only your machine has
+
+The source names only the tools every install has (the memory database and its skills). Anything
+else you want the voice brain or the worker to reach for -- a script over your own task list, a
+skill for one of your apps -- goes in `listener.json`, so it never ships to anyone without it:
+
+- **`ResponderTools`** -- a paragraph added to the voice brain's instructions: what quick read-only
+  lookup it can make and the exact command. For example: `For my task list (what's overdue, due
+  today), run: python -I "C:\path\to\todo.py" list`.
+- **`WorkerTools`** -- a line added to each task worker's ground rules: which skills it may use
+  and when. For example: `/todo-handoff starts a session on a task from my list -- when I ask to
+  hand one off, run it rather than doing the work yourself.`
+
+Both are empty by default, and a change takes effect when the daemon restarts. Commands the voice
+brain runs still need a matching allow rule in `voice-settings.json`.

@@ -78,6 +78,10 @@ public sealed partial class Responder : IDisposable
         set { if (Math.Abs(value - _kokoroSpeed) > 0.001f) { _kokoroSpeed = value; _log?.Invoke($"TTS speed -> {value:0.00}"); } }
     }
 
+    // Where listener.json's ResponderTools go: lookups only this machine has (a task list script, say), so the
+    // shared source names no tool another install won't have.
+    const string LocalToolsMarker = "<<LOCAL_TOOLS>>";
+
     // The standing instructions the voice session gets once, at spawn -- not per query.
     const string Instructions =
         "You are Claude, {{USER_NAME}}'s always-on voice assistant on his work machine. Every later message in this " +
@@ -92,9 +96,7 @@ public sealed partial class Responder : IDisposable
         "answers), digest_lines; full-text " +
         "search via <table>_fts with fts_any('words'). Use a lookup when the question needs one, keep it to a " +
         "couple of quick LIMITed queries, and never write to the database. The schema is at " +
-        @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + " if you need it. For {{USER_NAME}}'s EmailTodo task list " +
-        "(what's overdue, due today, who he owes replies to), run the read-only todo script: " +
-        "python -I \"" + @"{{CLAUDE_HOME_WIN}}\skills\todo\scripts\todo.py" + "\" list | task <key> | recent.\n\n" +
+        @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + " if you need it.\n\n" + LocalToolsMarker +
         "When you are about to use a tool, FIRST write one short sentence saying what you're checking (\"Let me " +
         "check the notes.\") -- it is spoken aloud while the lookup runs, so {{USER_NAME}} isn't left in silence.\n\n" +
         "Control outputs -- when one applies it must be the VERY FIRST characters of the reply:\n" +
@@ -111,10 +113,12 @@ public sealed partial class Responder : IDisposable
         "Reply with just: ready";
 
     public Responder(string claudePath, string model, string settingsPath, string kokoroDir, int kokoroVoice, float kokoroSpeed,
-        double awaitSeconds, double conversationSeconds,
+        double awaitSeconds, double conversationSeconds, string localTools,
         Func<string> context, Action<bool> speaking, Action? exchanged, Action<string>? misfire, Action<string>? queueTask, Action<string>? log)
     {
-        _brain = new Brain(claudePath, model, settingsPath, Instructions, log);
+        var instructions = Instructions.Replace(LocalToolsMarker,
+            string.IsNullOrWhiteSpace(localTools) ? "" : localTools.Trim() + "\n\n");
+        _brain = new Brain(claudePath, model, settingsPath, instructions, log);
         _awaitSeconds = awaitSeconds;
         _conversationSeconds = conversationSeconds;
         _context = context;

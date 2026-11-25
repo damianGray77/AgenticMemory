@@ -921,7 +921,7 @@ var lastPrune = DateTime.Now;
 // the desktop app. See Worker.cs.
 var worker = config.WorkerEnabled
     ? new Worker(config.ClaudePath, config.WorkerModel, Path.Combine(Root, "worker-settings.json"),
-        config.WorkerTimeoutMinutes, config.WorkerAdoptSessions, Exec, s => responder?.AskAloud(s) ?? false, Log)
+        config.WorkerTimeoutMinutes, config.WorkerAdoptSessions, config.WorkerTools, Exec, s => responder?.AskAloud(s) ?? false, Log)
     : null;
 
 // A spoken work request lands here instead of being attempted by voice: the row is the durable
@@ -937,7 +937,7 @@ void QueueTask(string request)
 responder = config.ResponderEnabled
     ? new Responder(config.ClaudePath, config.ResponderModel, Path.Combine(Root, "voice-settings.json"),
         Path.Combine(Root, "models", "kokoro"), config.TtsVoice, config.TtsSpeed,
-        config.AwaitQuerySeconds, config.ConversationSeconds, RecentContext,
+        config.AwaitQuerySeconds, config.ConversationSeconds, config.ResponderTools, RecentContext,
         s => { if (!s) lastSpokeAt = DateTime.Now; Volatile.Write(ref speaking, s); },
         () => addressee?.ExchangeHappened(), Misfire, QueueTask, Log)
     : null;
@@ -1141,6 +1141,14 @@ sealed class Config
     /// <summary>Open each finished run in the Claude desktop app (claude --desktop --resume), so
     /// every voice-created task session is visible there without asking.</summary>
     public bool WorkerAdoptSessions { get; set; } = true;
+
+    // ---- Tools only this machine has (empty by default; set in listener.json) ----
+    /// <summary>Added to the voice brain's instructions: quick read-only lookups this machine offers, such as a
+    /// task list script, and how to run them. Kept out of the source so it names no tool another install lacks.</summary>
+    public string ResponderTools { get; set; } = "";
+    /// <summary>Added to each task worker's ground rules as a line of its own: skills this machine has that a
+    /// spoken task may use, and when to reach for them.</summary>
+    public string WorkerTools { get; set; } = "";
 
     // ---- Addressee detector (the learned "was that said TO me?") ----
     /// <summary>The continually-learning no-wake-word detector (models\minilm + addressee-weights.json).</summary>

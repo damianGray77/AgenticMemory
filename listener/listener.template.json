@@ -34,5 +34,7 @@
   "SpeakerStickSeconds": 30,
   "SpeakerStickThreshold": 0.70,
   "PauseMilliseconds": 800,
-  "RetentionDays": 14
+  "RetentionDays": 14,
+  "ResponderTools": "",
+  "WorkerTools": ""
 }
