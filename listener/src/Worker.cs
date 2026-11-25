@@ -81,7 +81,10 @@ public sealed class Worker
             $"\"{request}\"\n\n" +
             "Do the work now. Ground rules:\n" +
             "- Tools you are set up for: the todo skills (/todo, /todo-task, /todo-recent) for {{USER_NAME}}'s EmailTodo " +
-            "task list; read-only SQL over the claude_memory database " +
+            "task list; /todo-handoff to start Claude working on one of those tasks -- when he asks to hand off, " +
+            "delegate, start on or spin up a session for a task from his list, find it and run /todo-handoff: it " +
+            "starts its own auto-mode session in the task's folder, so do not attempt the task's work yourself, and " +
+            "if it says several tasks match, ask him which by naming them briefly; read-only SQL over the claude_memory database " +
             "(\"{{MEMDB_POSIX}}\" -e \"<SQL>\", schema at " +
             @"{{CLAUDE_HOME_WIN}}\claude_memory_schema.sql" + "); reading files; and session notes through the " +
             "memory skill's mem.ps1. Write to the database no other way, and never touch the voice_tasks table " +
