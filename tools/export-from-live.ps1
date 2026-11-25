@@ -29,6 +29,8 @@ param(
     [string] $ClaudeHome = (Join-Path $env:USERPROFILE '.claude'),
     [string] $DbPath,
     [string] $ConsolidatorRoot = 'C:\Tools\consolidator',
+    [string] $ListenerRoot = 'C:\Tools\listener',
+    [string] $ReflectorRoot = 'C:\Tools\reflector',
     [string] $ClaudeCli = 'C:\Tools\npm\claude.cmd',
     [string] $RepoRoot
 )
@@ -43,18 +45,23 @@ $manifest = Import-PowerShellDataFile (Join-Path $RepoRoot 'manifest.psd1')
 $memdb = Join-Path $ClaudeHome 'bin\memdb.exe'
 if (-not $DbPath) { $DbPath = (Invoke-MemdbCapture -Memdb $memdb -Arguments @('--path')).Trim() }
 $map = Get-TokenMap -UserName $UserName -ClaudeHome $ClaudeHome -DbPath $DbPath `
-    -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli
+    -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli -ListenerRoot $ListenerRoot -ReflectorRoot $ReflectorRoot
 
 # ---------------------------------------------------------------------------------------------
 # Reverse substitution: paths (literal, case-insensitive, longest first so no path is half-replaced
 # by a shorter one), then the user's name.
 # ---------------------------------------------------------------------------------------------
 $rules = New-Object System.Collections.Generic.List[object]
-$pathTokens = @($map.Keys | Where-Object { $_ -ne 'USER_NAME' })
+# The name tokens get their own case-SENSITIVE, word-bounded rules below: a path rule for them
+# (case-insensitive, unbounded) would swallow the other spelling and match inside larger words.
+$pathTokens = @($map.Keys | Where-Object { $_ -notin 'USER_NAME', 'USER_NAME_LOWER' })
 $pathTokens | Sort-Object { $map[$_].Length } -Descending | ForEach-Object {
     $rules.Add(@{ Pattern = [regex]::Escape($map[$_]); Replacement = "{{$_}}"; Options = 'IgnoreCase' })
 }
 $rules.Add(@{ Pattern = "\b$([regex]::Escape($UserName))\b"; Replacement = '{{USER_NAME}}'; Options = 'None' })
+# The listener's enrolled-voice name is the lowercase spelling ("damian.json", percepts tagged
+# [damian]); both rules are case-sensitive so each spelling keeps its own token.
+$rules.Add(@{ Pattern = "\b$([regex]::Escape($UserName.ToLowerInvariant()))\b"; Replacement = '{{USER_NAME_LOWER}}'; Options = 'None' })
 
 function ConvertTo-Template([string] $Text) {
     foreach ($r in $rules) {
@@ -72,6 +79,8 @@ $exported = New-Object System.Collections.Generic.List[string]
 $sets = @(
     @{ Source = $ClaudeHome;       Dest = 'home';                Files = $manifest.Home }
     @{ Source = $ConsolidatorRoot; Dest = 'consolidator-runner'; Files = $manifest.Runner }
+    @{ Source = $ListenerRoot;     Dest = 'listener';            Files = $manifest.Listener }
+    @{ Source = $ReflectorRoot;    Dest = 'reflector-runner';    Files = $manifest.Reflector }
 )
 foreach ($set in $sets) {
     foreach ($rel in $set.Files) {

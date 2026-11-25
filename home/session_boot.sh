@@ -177,6 +177,36 @@ else
 fi
 echo ""
 
+# --- Step 4c: Latest reflection + open threads (sleep-time compute) ---
+# The nightly reflection pass (skill 'reflect', task ClaudeNightlyReflection) re-reads
+# recent work and writes one thought + the open questions it is carrying. Printing it
+# here is the point of the whole mechanism: the session starts having "slept on it".
+REFLECTION=$("$MEMDB" -N -r -e "
+  SELECT strftime('%Y-%m-%d', created_at) || ' [' || kind || '] ' || title || char(10) || content
+  FROM reflections WHERE is_active = 1 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+if [ -n "$REFLECTION" ]; then
+  echo "=== REFLECTION (latest sleep-time pass) ==="
+  echo "$REFLECTION"
+  OPEN_THREADS=$("$MEMDB" -N -r -e "
+    SELECT '  #' || t.id || IFNULL(' [' || p.slug || ']', '') || ' ' || t.question
+    FROM reflection_threads t LEFT JOIN projects p ON p.id = t.project_id
+    WHERE t.status = 'open' ORDER BY t.updated_at DESC;" 2>/dev/null)
+  if [ -n "$OPEN_THREADS" ]; then
+    echo "--- open threads (questions being carried between passes) ---"
+    echo "$OPEN_THREADS"
+  fi
+  echo ""
+fi
+
+# --- Step 4d: Ambient hearing ({{LISTENER_ROOT_WIN}} -> percepts; mute.ps1 toggles) ---
+PERCEPTS=$(run_sql "
+  SELECT COUNT(*) || ' speech percept(s) in last 24h (latest ' || IFNULL(MAX(heard_at), 'none') || ')'
+  FROM percepts WHERE heard_at > datetime(now(), '-1 day');" 2>/dev/null)
+if [ -n "$PERCEPTS" ]; then
+  echo "=== PERCEPTS: $PERCEPTS -- query percepts/percepts_fts for ambient context ==="
+  echo ""
+fi
+
 # --- Steps 5-7: full memory context (loaded only with --full) ---
 if [ "$FULL" = "1" ]; then
 

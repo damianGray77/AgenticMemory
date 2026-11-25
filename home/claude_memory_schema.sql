@@ -559,3 +559,168 @@ CREATE TRIGGER IF NOT EXISTS behaviours_fts_ad AFTER DELETE ON behaviours BEGIN
 CREATE TRIGGER IF NOT EXISTS behaviours_fts_au AFTER UPDATE OF subject, statement ON behaviours BEGIN
   INSERT INTO behaviours_fts (behaviours_fts, rowid, subject, statement) VALUES ('delete', OLD.id, OLD.subject, OLD.statement);
   INSERT INTO behaviours_fts (rowid, subject, statement) VALUES (NEW.id, NEW.subject, NEW.statement); END;
+
+-- ---------------------------------------------------------------------------
+-- Sleep-time reflection: a generative nightly pass (skill 'reflect', scheduled task
+-- ClaudeNightlyReflection -> {{REFLECTOR_ROOT_WIN}}\run-reflection.ps1).
+-- Consolidation compresses what happened; a reflection THINKS about it: cross-session
+-- patterns, hypotheses, and open questions. reflection_threads is the continuity
+-- mechanism -- each run begins by reading what the last run was wondering about, so
+-- isolated nightly runs become a train of thought. Rumination guard: a thread that
+-- produces nothing new twice in a row is retired (nothing_new_count).
+-- Evidence is cited inline in content as Rule 11 tokens: [[transcript:<id>#<uuid>..<uuid>]]
+-- or as session ids (S<id>). Config keys live in consolidation_config:
+--   reflection_enabled (kill switch), reflection_lookback_days, reflection_max_open_threads.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS reflections (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id     TEXT    COLLATE NOCASE,                -- REFL-YYYYMMDD-HHMM
+  title      TEXT    NOT NULL COLLATE NOCASE CHECK (length(title) <= 255),
+  content    TEXT    NOT NULL,                      -- the thought itself, with inline back-pointers
+  kind       TEXT    NOT NULL DEFAULT 'reflection' COLLATE NOCASE CHECK (kind IN ('reflection','quiet')),
+  is_active  INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT    NOT NULL DEFAULT (now())
+);
+CREATE INDEX IF NOT EXISTS ix_reflections_active ON reflections (is_active, created_at);
+
+CREATE TABLE IF NOT EXISTS reflection_threads (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id           INTEGER REFERENCES projects (id) ON DELETE SET NULL,   -- NULL = global
+  question             TEXT    NOT NULL,            -- what the reflector is carrying forward
+  status               TEXT    NOT NULL DEFAULT 'open' COLLATE NOCASE CHECK (status IN ('open','closed','retired')),
+  resolution           TEXT,                        -- set when closed (the answer) or retired (why)
+  nothing_new_count    INTEGER NOT NULL DEFAULT 0,  -- consecutive runs with no progress; 2 retires it
+  opened_reflection_id INTEGER REFERENCES reflections (id) ON DELETE SET NULL,
+  closed_reflection_id INTEGER REFERENCES reflections (id) ON DELETE SET NULL,
+  created_at           TEXT    NOT NULL DEFAULT (now()),
+  updated_at           TEXT    NOT NULL DEFAULT (now())
+);
+CREATE INDEX IF NOT EXISTS ix_threads_status ON reflection_threads (status, updated_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_reflection_threads_touch AFTER UPDATE ON reflection_threads
+WHEN NEW.updated_at IS OLD.updated_at AND (
+     NEW.project_id IS NOT OLD.project_id OR NEW.question IS NOT OLD.question
+  OR NEW.status IS NOT OLD.status COLLATE BINARY OR NEW.resolution IS NOT OLD.resolution
+  OR NEW.nothing_new_count IS NOT OLD.nothing_new_count
+  OR NEW.opened_reflection_id IS NOT OLD.opened_reflection_id
+  OR NEW.closed_reflection_id IS NOT OLD.closed_reflection_id)
+BEGIN UPDATE reflection_threads SET updated_at = now() WHERE id = NEW.id; END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS reflections_fts USING fts5(title, content, content='reflections', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS reflections_fts_ai AFTER INSERT ON reflections BEGIN
+  INSERT INTO reflections_fts (rowid, title, content) VALUES (NEW.id, NEW.title, NEW.content); END;
+CREATE TRIGGER IF NOT EXISTS reflections_fts_ad AFTER DELETE ON reflections BEGIN
+  INSERT INTO reflections_fts (reflections_fts, rowid, title, content) VALUES ('delete', OLD.id, OLD.title, OLD.content); END;
+CREATE TRIGGER IF NOT EXISTS reflections_fts_au AFTER UPDATE OF title, content ON reflections BEGIN
+  INSERT INTO reflections_fts (reflections_fts, rowid, title, content) VALUES ('delete', OLD.id, OLD.title, OLD.content);
+  INSERT INTO reflections_fts (rowid, title, content) VALUES (NEW.id, NEW.title, NEW.content); END;
+
+-- ---------------------------------------------------------------------------
+-- Percepts: ambient sensory input ({{LISTENER_ROOT_WIN}}, task ClaudeListener).
+-- A continuous local pipeline (WASAPI mic -> Silero VAD -> Whisper, reused from
+-- EmailTodo's Transcriber) writes what it hears as timestamped rows; sessions and
+-- the nightly reflection pass read them. Raw audio is never stored -- transcription
+-- only. kind 'sound' is reserved for a future audio-tagging fork (YAMNet) and
+-- 'sight' for a future webcam v2. A MUTE file in {{LISTENER_ROOT_WIN}} silences capture.
+-- Retention: the listener prunes rows older than percept_retention_days
+-- (consolidation_config, default 14) on start and daily.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS percepts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind       TEXT    NOT NULL DEFAULT 'speech' COLLATE NOCASE CHECK (kind IN ('speech','sound','sight')),
+  heard_at   TEXT    NOT NULL,                  -- local time the stretch of speech started
+  duration_s REAL,                              -- seconds of actual speech in the stretch (silence removed)
+  content    TEXT    NOT NULL,                  -- transcribed text (or sound/scene labels later)
+  source     TEXT    COLLATE NOCASE DEFAULT 'listener',
+  created_at TEXT    NOT NULL DEFAULT (now()),
+  speaker    TEXT    COLLATE NOCASE             -- enrolled name (WeSpeaker match), 'other', or NULL (not computed)
+);
+CREATE INDEX IF NOT EXISTS ix_percepts_heard ON percepts (heard_at);
+CREATE INDEX IF NOT EXISTS ix_percepts_kind  ON percepts (kind, heard_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS percepts_fts USING fts5(content, content='percepts', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS percepts_fts_ai AFTER INSERT ON percepts BEGIN
+  INSERT INTO percepts_fts (rowid, content) VALUES (NEW.id, NEW.content); END;
+CREATE TRIGGER IF NOT EXISTS percepts_fts_ad AFTER DELETE ON percepts BEGIN
+  INSERT INTO percepts_fts (percepts_fts, rowid, content) VALUES ('delete', OLD.id, OLD.content); END;
+CREATE TRIGGER IF NOT EXISTS percepts_fts_au AFTER UPDATE OF content ON percepts BEGIN
+  INSERT INTO percepts_fts (percepts_fts, rowid, content) VALUES ('delete', OLD.id, OLD.content);
+  INSERT INTO percepts_fts (rowid, content) VALUES (NEW.id, NEW.content); END;
+
+-- ---------------------------------------------------------------------------
+-- Addressee events: the continually-learning "was that said TO Claude?" detector
+-- ({{LISTENER_ROOT_WIN}}, Addressee.cs). Every judged {{USER_NAME_LOWER}}/unidentified speech
+-- utterance gets a row: the model's score, what was decided, and -- once life
+-- reveals it -- the label. Labels are harvested, not annotated: a wake-worded
+-- utterance is a positive ('wake'), speech while another voice is active is a
+-- negative ('other_interleave'), speech that drew no wake retry is a weak
+-- negative ('timeout'). decision 'wake'/'conversation' = the responder consumed
+-- it; 'shadow_yes'/'shadow_no' = the detector's silent call while it is still
+-- earning speaking rights; 'respond'/'suppress' = live-mode outcomes. Model
+-- weights live in {{LISTENER_ROOT_WIN}}\addressee-weights.json, not here. The
+-- precision of shadow_yes rows against later 'wake' labels is the detector's
+-- readiness report -- reflection-pass material.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS addressee_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  percept_id   INTEGER,                -- percepts.id of the judged utterance
+  heard_at     TEXT NOT NULL,
+  score        REAL NOT NULL,          -- sigmoid probability it was addressed to Claude
+  decision     TEXT NOT NULL COLLATE NOCASE CHECK (decision IN ('wake','conversation','shadow_yes','shadow_no','respond','suppress')),
+  label        INTEGER CHECK (label IN (0,1)),
+  label_source TEXT COLLATE NOCASE CHECK (label_source IN ('wake','followup','other_interleave','timeout','correction','manual')),
+  label_weight REAL,                   -- SGD sample weight (timeout negatives are weak, ~0.15)
+  labeled_at   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (now())
+);
+CREATE INDEX IF NOT EXISTS ix_addressee_heard ON addressee_events (heard_at);
+CREATE INDEX IF NOT EXISTS ix_addressee_label ON addressee_events (label, heard_at);
+
+-- ---------------------------------------------------------------------------
+-- Voice tasks: the hand-off from the voice channel to a working session. When
+-- {{USER_NAME}} asks the voice responder for real work (code changes, commits, jobs,
+-- tickets -- anything beyond conversation and quick lookups), the voice brain
+-- answers [TASK] <restatement>, the listener inserts a row here and says so
+-- aloud, and a working Claude Code session watching this table picks it up:
+-- UPDATE status='picked_up', picked_up_by='S<session_id>', then 'done' (or
+-- 'dismissed') with notes. The voice channel never does the work itself.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS voice_tasks (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  requested_at TEXT NOT NULL,
+  request      TEXT NOT NULL,                 -- the voice brain's one-line restatement of the ask
+  status       TEXT NOT NULL COLLATE NOCASE DEFAULT 'new' CHECK (status IN ('new','picked_up','done','dismissed')),
+  picked_up_by TEXT,                          -- 'S<session_id>' of the session doing the work
+  completed_at TEXT,
+  notes        TEXT,
+  created_at   TEXT NOT NULL DEFAULT (now())
+);
+CREATE INDEX IF NOT EXISTS ix_voice_tasks_status ON voice_tasks (status, requested_at);
+
+-- ---------------------------------------------------------------------------
+-- Noticings: the day-mind's quiet observations (the fast half of the two-speed
+-- mind; the reflection pass is the slow half). The listener scores every percept
+-- for salience locally and for free -- embedding novelty against a running
+-- centroid, speaker changes, re-engagement after silence, scene changes -- and
+-- when enough salience accumulates it hands the window of percepts to a small
+-- persistent model that writes ONE one-or-two-sentence observation here. The
+-- daily reflection pass (ClaudeReflection task, 3-hourly opportunistic, one pass
+-- a day) reads these first: the day already half-compressed, each row pointing
+-- at its raw percepts (percept_from..percept_to). Noticing registers; it never
+-- interprets -- meaning-making is reflection's job.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS noticings (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  noticed_at   TEXT NOT NULL,
+  content      TEXT NOT NULL,                 -- one quiet observation, plain prose
+  salience     REAL,                          -- the accumulated score that pulled the trigger
+  percept_from INTEGER,                       -- the window of percepts it covers
+  percept_to   INTEGER,
+  created_at   TEXT NOT NULL DEFAULT (now())
+);
+CREATE INDEX IF NOT EXISTS ix_noticings_at ON noticings (noticed_at);

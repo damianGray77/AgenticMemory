@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"{{MEMDB_POSIX}}\":*)",
+      "Bash(date:*)",
+      "Read",
+      "Edit(/{{REFLECTOR_ROOT_POSIX}}/runs/**)"
+    ]
+  }
+}

@@ -10,10 +10,16 @@
       1. memdb      compile memdb.exe into <ClaudeHome>\bin
       2. Files      home\*                -> the Claude config folder (~\.claude)
                     consolidator-runner\* -> the consolidation runner folder (C:\Tools\consolidator)
+                    reflector-runner\*    -> the reflection runner folder (C:\Tools\reflector)
+                    listener\src\*        -> the voice listener folder (C:\Tools\listener), built
+                    with the dotnet SDK when it is installed (-SkipListener to leave it out);
+                    speech models and voice enrollment stay manual -- see listener\README.md
       3. Database   create or update the database file: tables, full-text indexes, seed rows, views
       4. Settings   SessionStart/SessionEnd hooks in ~\.claude\settings.json, and Claude Code's
                     built-in auto memory turned off (the database replaces it)
-      5. Optional   the 3-hourly judgment-tier consolidation task (-RegisterConsolidationTask)
+      5. Optional   the 3-hourly judgment-tier consolidation task (-RegisterConsolidationTask),
+                    the 3-hourly reflection task (-RegisterReflectionTask), and the at-logon
+                    listener task (-RegisterListenerTask)
 
     Safe to re-run, which is also how you upgrade: a file that would change is backed up first to
     ~\.claude\backups\claude-memory-install-<stamp>\, tables are only created when missing, views
@@ -33,6 +39,16 @@
     Register the Windows scheduled task that runs the consolidate-memory-db skill headless every
     3 hours. Needs the claude CLI at a path a scheduled task can reach (-ClaudeCli).
 
+.PARAMETER RegisterReflectionTask
+    Register the Windows scheduled task that runs the reflect skill headless every 3 hours (the
+    skill's one-pass-per-day guard makes the day's first slot the one that reflects). Needs the
+    claude CLI at a path a scheduled task can reach (-ClaudeCli).
+
+.PARAMETER RegisterListenerTask
+    Register (and start) the Windows scheduled task that runs the voice listener at logon. Only
+    useful once the speech models are in <ListenerRoot>\models and a voice is enrolled -- see
+    listener\README.md.
+
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -UserName Alex
 
@@ -45,13 +61,20 @@ param(
     [string] $ClaudeHome = (Join-Path $env:USERPROFILE '.claude'),
     [string] $DbPath,
     [string] $ConsolidatorRoot = 'C:\Tools\consolidator',
+    [string] $ListenerRoot = 'C:\Tools\listener',
+    [string] $ReflectorRoot = 'C:\Tools\reflector',
     [string] $ClaudeCli,
     [switch] $WireSessionClose,
     [switch] $RegisterConsolidationTask,
     [string] $TaskName = 'ClaudeMemoryConsolidation',
+    [switch] $RegisterReflectionTask,
+    [string] $ReflectionTaskName = 'ClaudeReflection',
+    [switch] $RegisterListenerTask,
+    [string] $ListenerTaskName = 'ClaudeListener',
     [switch] $SkipFiles,
     [switch] $SkipDatabase,
-    [switch] $SkipSettings
+    [switch] $SkipSettings,
+    [switch] $SkipListener
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,7 +121,7 @@ if (-not $bash -and -not (Test-Path 'C:\Program Files\Git\bin\bash.exe')) {
 }
 
 $map = Get-TokenMap -UserName $UserName -ClaudeHome $ClaudeHome -DbPath $DbPath `
-    -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli
+    -ConsolidatorRoot $ConsolidatorRoot -ClaudeCli $ClaudeCli -ListenerRoot $ListenerRoot -ReflectorRoot $ReflectorRoot
 Write-Item 'home' $map.CLAUDE_HOME_WIN
 Write-Item 'database' $map.DB_PATH_WIN
 Write-Item 'runner' $map.CONSOLIDATOR_ROOT_WIN
@@ -215,6 +238,58 @@ if (-not $SkipFiles) {
         Write-Item (Set-InstalledFile (Join-Path $ConsolidatorRoot $rel) $text $ConsolidatorRoot) $rel
     }
     foreach ($d in @('logs', 'runs')) { New-Item -ItemType Directory -Force -Path (Join-Path $ConsolidatorRoot $d) | Out-Null }
+
+    Write-Step "Installing the reflection runner into $($map.REFLECTOR_ROOT_WIN)"
+    foreach ($rel in $manifest.Reflector) {
+        $text = Expand-Template (Join-Path $repo "reflector-runner\$rel")
+        Write-Item (Set-InstalledFile (Join-Path $ReflectorRoot $rel) $text $ReflectorRoot) $rel
+    }
+    foreach ($d in @('logs', 'runs')) { New-Item -ItemType Directory -Force -Path (Join-Path $ReflectorRoot $d) | Out-Null }
+}
+
+# =============================================================================================
+# 2b. Voice listener (source + build; speech models and voice enrollment stay manual)
+# =============================================================================================
+if (-not $SkipFiles -and -not $SkipListener) {
+    Write-Step "Installing the voice listener into $($map.LISTENER_ROOT_WIN)"
+    foreach ($rel in $manifest.Listener) {
+        $text = Expand-Template (Join-Path $repo "listener\$rel")
+        Write-Item (Set-InstalledFile (Join-Path $ListenerRoot $rel) $text $ListenerRoot) $rel
+    }
+    # The config is personal, per-machine tuning: seeded from the template once, never overwritten.
+    $listenerConfig = Join-Path $ListenerRoot 'listener.json'
+    if (Test-Path -LiteralPath $listenerConfig) { Write-Item 'kept' 'listener.json' }
+    else {
+        Write-Utf8 $listenerConfig (Expand-Template (Join-Path $repo 'listener\listener.template.json'))
+        Write-Item 'created' 'listener.json (from listener.template.json -- put your names/jargon in Prompt)'
+    }
+    foreach ($d in @('logs', 'voices', 'models')) { New-Item -ItemType Directory -Force -Path (Join-Path $ListenerRoot $d) | Out-Null }
+
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        Write-Warning "dotnet SDK not found: listener source installed but not built. Install the .NET 10 SDK, then: dotnet publish $ListenerRoot\src -c Release -o $ListenerRoot\bin"
+    } else {
+        # A running daemon holds bin\Listener.exe locked; stop it for the publish and restart after.
+        $wasRunning = [bool](Get-Process -Name Listener -ErrorAction SilentlyContinue)
+        if ($wasRunning) {
+            schtasks /end /tn $ListenerTaskName 2>$null | Out-Null
+            Stop-Process -Name Listener -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+        & dotnet publish (Join-Path $ListenerRoot 'src') -c Release -o (Join-Path $ListenerRoot 'bin') -v q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Listener build failed; run: dotnet build $ListenerRoot\src -c Release" }
+        Write-Item 'built' 'bin\Listener.exe'
+        if ($RegisterListenerTask) {
+            schtasks /create /tn $ListenerTaskName /tr (Join-Path $ListenerRoot 'bin\Listener.exe') /sc onlogon /rl limited /f | Out-Null
+            schtasks /run /tn $ListenerTaskName | Out-Null
+            Write-Item 'task' "$ListenerTaskName (at logon; started)"
+        } elseif ($wasRunning) {
+            schtasks /run /tn $ListenerTaskName 2>$null | Out-Null
+            Write-Item 'restarted' $ListenerTaskName
+        }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $ListenerRoot 'models\parakeet\encoder.int8.onnx'))) {
+        Write-Warning "Speech models are not under $ListenerRoot\models yet -- the listener cannot run without them. Sources: listener\README.md. Then enroll a voice: $ListenerRoot\bin\Listener.exe enroll <name>"
+    }
 }
 
 # =============================================================================================
@@ -368,6 +443,26 @@ if ($RegisterConsolidationTask) {
         -Description 'Claude memory consolidation (judgment tier) via the consolidate-memory-db skill, every 3 hours. Gated by consolidation_config in the claude_memory database.' `
         -Force | Out-Null
     Write-Item 'registered' "$TaskName -> $runner"
+}
+
+# =============================================================================================
+# 5b. Scheduled reflection (optional)
+# =============================================================================================
+if ($RegisterReflectionTask) {
+    Write-Step "Registering scheduled task $ReflectionTaskName"
+    $runner = Join-Path $ReflectorRoot 'run-reflection.ps1'
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' `
+        -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$runner`""
+    # Every 3 hours at :37 (offset from the consolidation task's :07): opportunistic, because the
+    # machine sleeps at night; the skill's one-pass-per-day guard makes the day's FIRST slot reflect.
+    $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date.AddMinutes(37)) -RepetitionInterval (New-TimeSpan -Hours 3)
+    $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $ReflectionTaskName -Action $action -Trigger $trigger -Settings $taskSettings -Principal $principal `
+        -Description 'Claude daily reflection via the reflect skill, every 3 hours with a one-pass-per-day guard. Gated by reflection_enabled in the claude_memory database.' `
+        -Force | Out-Null
+    Write-Item 'registered' "$ReflectionTaskName -> $runner"
 }
 
 # =============================================================================================

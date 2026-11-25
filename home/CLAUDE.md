@@ -86,8 +86,8 @@ Raw Claude Code session transcripts are archived losslessly in the `transcripts`
 - **Attach back-pointer(s) whenever you promote or compress a note/memory.** A topic usually spans several places, so a memory may have MANY `memory_sources` rows — each a contiguous span (`start_message_uuid`..`end_message_uuid`) or a single message (`end_message_uuid` NULL), and different rows may point to different transcripts/sessions. Write each span with `mem.ps1 -Action source -MemoryId <id>` (or `-NoteId`) `-TranscriptId <id> -StartUuid <u> [-EndUuid <u>]` — call it once per span, it appends rather than replaces. Inline, cite as `[[transcript:<id>#<start>..<end>]]`; list multiple spans (`#a..b,f,k..m`) or use several tokens. This guarantees a compressed memory traces back to every verbatim exchange it came from.
 - **Resolve** back-pointers with the `resolve-memory-sources` / `resolve-note-sources` reference_query (aggregates all of a memory's spans): each `message_uuid` → `transcript_messages` (`byte_offset`/`byte_length`) → slice `uncompress(transcripts.raw_jsonl)`.
 
-## Schema Maintenance
-For the `claude_memory` database: apply schema changes directly to the live database and mirror them into `claude_memory_schema.sql` in place — do NOT create sequential migration files for it. Copying the database file is the cross-device mechanism. (A deliberate exception for this database; other projects' databases may still want migration files.)
+## Schema Maintenance (exception to memory 79)
+For the `claude_memory` DB ONLY: apply schema changes directly to the live DB and mirror them into `claude_memory_schema.sql` in place — do NOT create sequential migration files here. Copying the database file is the cross-device mechanism. (Deliberate, user-approved exception; the migration-file preference still applies to the SVN/PM project DBs.)
 
 ## Reference Queries
 Search for pre-built queries: `SELECT name, sql_template FROM reference_queries WHERE name = '<name>';`

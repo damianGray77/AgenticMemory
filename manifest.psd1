@@ -23,6 +23,7 @@
         'skills\memory\scripts\mem.ps1'
         'skills\recall\SKILL.md'
         'skills\consolidate-memory-db\SKILL.md'
+        'skills\reflect\SKILL.md'
     )
 
     # Relative to the consolidation runner folder (C:\Tools\consolidator by default).
@@ -30,6 +31,36 @@
     Runner = @(
         'run-consolidation.ps1'
         'runner-settings.json'
+    )
+
+    # Relative to the reflection runner folder (C:\Tools\reflector by default). Stored in the repo
+    # under reflector-runner\. Fires the 'reflect' skill headless every 3 hours; the skill's
+    # one-pass-per-day guard makes the first slot of each day the one that reflects.
+    Reflector = @(
+        'run-reflection.ps1'
+        'runner-settings.json'
+    )
+
+    # Relative to the voice listener folder (C:\Tools\listener by default). Stored in the repo
+    # under listener\. SOURCE ONLY: the speech/voice models (~1.9 GB of ONNX/GGML binaries) and the
+    # enrolled voiceprints in voices\ (personal biometrics) never enter the repo -- listener\README.md
+    # says where each model comes from and how to enroll. listener.json is not exported either (its
+    # Prompt carries personal names and project jargon); install.ps1 seeds it once from the
+    # hand-written listener\listener.template.json and never overwrites it. install.ps1 renders and
+    # builds the listener (-SkipListener to leave it out); models and enrollment stay manual.
+    Listener = @(
+        'src\Listener.csproj'
+        'src\nuget.config'
+        'src\Addressee.cs'
+        'src\Brain.cs'
+        'src\Embedder.cs'
+        'src\Microphone.cs'
+        'src\Program.cs'
+        'src\Responder.cs'
+        'src\Salience.cs'
+        'src\SoundTagger.cs'
+        'src\SpeakerId.cs'
+        'src\Transcriber.cs'
     )
 
     # Database build order, all run through memdb. 'db:' paths are under db\ in the repo,
@@ -53,5 +84,5 @@
     )
 
     # What a complete install contains, checked at the end of install.ps1.
-    Expect = @{ Tables = 25; FtsIndexes = 7; Views = 14; Procedures = 21 }
+    Expect = @{ Tables = 31; FtsIndexes = 9; Views = 14; Procedures = 21 }
 }

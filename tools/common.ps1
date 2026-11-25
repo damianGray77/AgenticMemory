@@ -23,14 +23,21 @@ function Get-PathForms {
 function Get-TokenMap {
     param(
         [string] $UserName, [string] $ClaudeHome, [string] $DbPath,
-        [string] $ConsolidatorRoot, [string] $ClaudeCli
+        [string] $ConsolidatorRoot, [string] $ClaudeCli,
+        [string] $ListenerRoot = 'C:\Tools\listener',
+        [string] $ReflectorRoot = 'C:\Tools\reflector'
     )
     $home_ = Get-PathForms $ClaudeHome
     $memdb = Get-PathForms (Join-Path $ClaudeHome 'bin\memdb.exe')
     $db    = Get-PathForms $DbPath
     $run   = Get-PathForms $ConsolidatorRoot
+    $lsn   = Get-PathForms $ListenerRoot
+    $rfl   = Get-PathForms $ReflectorRoot
     $map = [ordered]@{
         USER_NAME               = $UserName
+        # The listener enrolls voices under the lowercase name ("damian.json", percepts tagged
+        # [damian]); its source and config refer to that spelling, so it tokenizes separately.
+        USER_NAME_LOWER         = $UserName.ToLowerInvariant()
         MEMDB_WIN               = $memdb.Win
         MEMDB_POSIX             = $memdb.Posix
         DB_PATH_WIN             = $db.Win
@@ -40,6 +47,9 @@ function Get-TokenMap {
         CONSOLIDATOR_ROOT_WIN   = $run.Win
         CONSOLIDATOR_ROOT_FWD   = $run.Fwd
         CONSOLIDATOR_ROOT_POSIX = $run.Posix
+        LISTENER_ROOT_WIN       = $lsn.Win
+        REFLECTOR_ROOT_WIN      = $rfl.Win
+        REFLECTOR_ROOT_POSIX    = $rfl.Posix
         CLAUDE_CLI_WIN          = $ClaudeCli.Replace('/', '\')
     }
     return $map
