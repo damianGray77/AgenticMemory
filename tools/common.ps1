@@ -44,6 +44,9 @@ function Get-TokenMap {
         CLAUDE_HOME_WIN         = $home_.Win
         CLAUDE_HOME_FWD         = $home_.Fwd
         CLAUDE_HOME_POSIX       = $home_.Posix
+        # The Windows path as it appears INSIDE a JSON string ("C:\\Users\\..."): settings files
+        # whose allow rules must match a command spelled with backslashes can't use the POSIX form.
+        CLAUDE_HOME_JSON        = $home_.Win.Replace('\', '\\')
         CONSOLIDATOR_ROOT_WIN   = $run.Win
         CONSOLIDATOR_ROOT_FWD   = $run.Fwd
         CONSOLIDATOR_ROOT_POSIX = $run.Posix

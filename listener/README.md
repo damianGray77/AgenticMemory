@@ -81,3 +81,16 @@ and voice enrollment (step 4) are always manual.
 - The self-hearing protections (it leaves the mic open while speaking, for barge-in) are not
   settings: while its TTS plays plus a 4 s echo tail, anything scoring close to its own voiceprint
   is tagged `claude` and never answered.
+
+## The task worker
+
+A spoken work request (the voice brain's `[TASK]` hand-off) is not just queued on `voice_tasks` --
+the daemon runs it, one at a time, in its own one-shot headless Claude session (`Worker.cs`):
+`claude -p` in **auto permission mode with prompts auto-denied**, so it can read files, query the
+memory database and run skills on its own, while anything that would need interactive approval is
+refused rather than hung (the prompt tells it to report what was denied). The result is spoken at
+the next quiet moment and saved on the row with the session id; `claude --desktop --resume
+<session id>` opens any run as a full session in the Claude desktop app. Tasks queued while the
+daemon was down are swept at startup (7-day cutoff). `WorkerEnabled` / `WorkerModel` /
+`WorkerTimeoutMinutes` in `listener.json`; the allow list lives in `worker-settings.json` (the
+voice brain's read-only one is `voice-settings.json`).

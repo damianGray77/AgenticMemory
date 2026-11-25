@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"{{MEMDB_POSIX}}\":*)",
+      "Bash(date:*)",
+      "Read"
+    ]
+  }
+}

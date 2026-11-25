@@ -244,17 +244,6 @@ var lastSpokeAt = DateTime.MinValue;     // when the TTS last fell silent -- ech
 // could just postpone asking until a quiet period"). Guarded by itself.
 var pendingAsks = new Queue<(string Question, DateTime At)>();
 
-object? Scalar(string sql, params (string Name, object Value)[] args)
-{
-    lock (dbGate)
-    {
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = sql;
-        foreach (var (name, value) in args) cmd.Parameters.AddWithValue(name, value);
-        return cmd.ExecuteScalar();
-    }
-}
-
 // INSERT and its last_insert_rowid under ONE lock -- split across two, a concurrent insert
 // from another thread would hand back the wrong id.
 long Insert(string sql, params (string Name, object Value)[] args)
@@ -710,13 +699,23 @@ Log($"Listener starting. Model {config.Model}, stretch {config.StretchSeconds}s,
 Prune();
 var lastPrune = DateTime.Now;
 
-// A spoken work request lands here instead of being attempted by voice: a row the main working
-// session picks up (it watches voice_tasks for status 'new').
+// The hands: each queued voice task runs in its own one-shot headless Claude session (auto
+// permission mode, prompts auto-denied), the result spoken at the next quiet moment and saved on
+// the voice_tasks row with the session id -- `claude --desktop --resume <id>` opens any run in
+// the desktop app. See Worker.cs.
+var worker = config.WorkerEnabled
+    ? new Worker(config.ClaudePath, config.WorkerModel, Path.Combine(Root, "worker-settings.json"),
+        config.WorkerTimeoutMinutes, Exec, s => responder?.AskAloud(s) ?? false, Log)
+    : null;
+
+// A spoken work request lands here instead of being attempted by voice: the row is the durable
+// record, and the worker (when enabled) picks it up immediately.
 void QueueTask(string request)
 {
     var now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-    Exec("INSERT INTO voice_tasks (requested_at, request, created_at) VALUES (@at, @req, @at)",
+    var id = Insert("INSERT INTO voice_tasks (requested_at, request, created_at) VALUES (@at, @req, @at)",
         ("@at", now), ("@req", request));
+    worker?.Run(id, request);
 }
 
 responder = config.ResponderEnabled
@@ -726,6 +725,26 @@ responder = config.ResponderEnabled
         s => { if (!s) lastSpokeAt = DateTime.Now; Volatile.Write(ref speaking, s); },
         () => addressee?.ExchangeHappened(), Misfire, QueueTask, Log)
     : null;
+
+// Tasks queued while the daemon was down are not lost: sweep recent unclaimed rows at startup.
+// The 7-day cutoff keeps a long-forgotten row from suddenly running months later.
+if (worker != null)
+{
+    var queued = new List<(long Id, string Request)>();
+    lock (dbGate)
+    {
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "SELECT id, request FROM voice_tasks WHERE status = 'new' " +
+                          "AND requested_at > datetime('now', 'localtime', '-7 days') ORDER BY id";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) queued.Add((reader.GetInt64(0), reader.GetString(1)));
+    }
+    foreach (var (tid, req) in queued)
+    {
+        Log($"Sweeping queued voice task {tid}: {req}");
+        worker.Run(tid, req);
+    }
+}
 
 if (config.SpeakerIdEnabled)
     try
@@ -863,6 +882,14 @@ sealed class Config
     public double AwaitQuerySeconds { get; set; } = 60;
     /// <summary>Follow-up window after each spoken reply (rolling): dialogue without re-waking.</summary>
     public double ConversationSeconds { get; set; } = 30;
+
+    // ---- Voice-task worker (the hands; see Worker.cs) ----
+    /// <summary>Run each queued voice task in its own one-shot headless session.</summary>
+    public bool WorkerEnabled { get; set; } = true;
+    /// <summary>Model for task work: more capable than the mouth's needs to be, still unattended-cheap.</summary>
+    public string WorkerModel { get; set; } = "sonnet";
+    /// <summary>A task session that runs longer than this is killed and the task marked failed.</summary>
+    public int WorkerTimeoutMinutes { get; set; } = 15;
 
     // ---- Addressee detector (the learned "was that said TO me?") ----
     /// <summary>The continually-learning no-wake-word detector (models\minilm + addressee-weights.json).</summary>

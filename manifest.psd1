@@ -49,6 +49,8 @@
     # hand-written listener\listener.template.json and never overwrites it. install.ps1 renders and
     # builds the listener (-SkipListener to leave it out); models and enrollment stay manual.
     Listener = @(
+        'voice-settings.json'
+        'worker-settings.json'
         'src\Listener.csproj'
         'src\nuget.config'
         'src\Addressee.cs'
@@ -61,6 +63,7 @@
         'src\SoundTagger.cs'
         'src\SpeakerId.cs'
         'src\Transcriber.cs'
+        'src\Worker.cs'
     )
 
     # Database build order, all run through memdb. 'db:' paths are under db\ in the repo,
