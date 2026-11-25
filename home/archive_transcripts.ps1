@@ -251,7 +251,12 @@ foreach ($line in (Run-Sql "SELECT session_uuid, id FROM sessions WHERE session_
   $sessByUuid[$u] = [int]$sid
 }
 
-$files = Get-ChildItem -LiteralPath $ProjectsRoot -Recurse -File -Filter *.jsonl
+# A folder Windows PowerShell 5.1 cannot list (a path past the 260-character limit, e.g. the
+# tool-results folder of a deeply nested scratch-workspace session) must not abort the whole sweep:
+# skip it, say so, and archive everything else.
+$scanErrors = $null
+$files = Get-ChildItem -LiteralPath $ProjectsRoot -Recurse -File -Filter *.jsonl -ErrorAction SilentlyContinue -ErrorVariable scanErrors
+foreach ($e in @($scanErrors)) { Write-Warning ("archive_transcripts skipped an unreadable folder: " + $e.TargetObject) }
 $seen=0; $skipped=0; $ingested=0; $msgTotal=0; $errors=0
 foreach ($f in $files) {
   $fullFwd = $f.FullName.Replace('\','/')
